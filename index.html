@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0e0b14">
+<title>Streamer</title>
+<style>
+:root{--bg:#0e0b14;--card:#1b1526;--fg:#efeaf6;--mut:#9a90ad;--ac:#ff5c93}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif}
+header{position:sticky;top:0;z-index:5;background:rgba(14,11,20,.94);display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 14px}
+.logo{font-weight:800;font-size:20px;margin-right:6px}
+#sf{display:flex;gap:6px;flex:1;min-width:200px}
+input,textarea{flex:1;min-width:0;background:var(--card);color:var(--fg);border:2px solid transparent;border-radius:10px;padding:10px 12px;font:inherit}
+button,.st{font:inherit;color:var(--fg);background:var(--card);border:2px solid transparent;border-radius:10px;padding:10px 14px;cursor:pointer;text-align:left;text-decoration:none;display:block}
+button.on,.pri{background:var(--ac);color:#1a0610;font-weight:700}
+button:focus-visible,input:focus,.card:focus-visible,.st:focus-visible{outline:3px solid #fff;outline-offset:2px}
+h2{font-size:18px;margin:18px 14px 6px}
+.mut{color:var(--mut);font-size:14px;margin:8px 14px}
+.row{display:flex;gap:10px;overflow-x:auto;padding:6px 14px 14px;scrollbar-width:none}
+.grid{display:flex;flex-wrap:wrap;gap:12px;padding:6px 14px}
+.card{flex:0 0 128px;width:128px;cursor:pointer;border-radius:10px}
+.card img{width:100%;aspect-ratio:2/3;object-fit:cover;border-radius:10px;background:var(--card);display:block}
+.card .t{font-size:13px;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card:focus-visible{transform:scale(1.06)}
+.hero{display:flex;gap:16px;padding:14px;flex-wrap:wrap}
+.hero img{width:160px;aspect-ratio:2/3;object-fit:cover;border-radius:12px;background:var(--card)}
+.hero .info{flex:1;min-width:240px;max-width:70ch}
+.hero h1{margin:0 0 6px;font-size:28px}
+.stack{display:grid;gap:8px;padding:0 14px 14px;max-width:760px}
+.st{white-space:pre-line}
+.st.off{opacity:.5;cursor:default}
+.ad{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--card);border-radius:10px;padding:10px 14px;margin:8px 14px}
+.add{display:flex;gap:8px;padding:0 14px}
+#pl{position:fixed;inset:0;z-index:20;background:#000;display:flex;align-items:center;justify-content:center}
+#pl video{width:100%;height:100%;background:#000}
+#pl .top{position:absolute;top:12px;right:12px;z-index:2;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;max-width:68%}
+#pl .x{background:rgba(0,0,0,.6)}
+.toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:rgba(0,0,0,.85);padding:10px 18px;border-radius:24px;z-index:30;font-size:20px}
+#pl .ttl{position:absolute;top:16px;left:16px;z-index:2;text-shadow:0 1px 4px #000;max-width:28%}
+#pl .err{position:absolute;bottom:80px;left:16px;right:16px;text-align:center;color:#ffb3c8}
+[hidden]{display:none!important}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+#pl .nx{position:absolute;bottom:24px;right:16px;z-index:3}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">Streamer</span>
+  <button onclick="location.hash='#/'">Home</button>
+  <button onclick="location.hash='#/addons'">Addons</button>
+  <button onclick="location.hash='#/party'">Party</button>
+  <form id="sf"><input id="q" type="search" placeholder="Search movies and series" enterkeyhint="search"><button class="pri">Search</button></form>
+</header>
+<main id="app"></main>
+<script>
+const $=s=>document.querySelector(s);
+const h=(t,a={},...k)=>{const e=document.createElement(t);for(const[n,v]of Object.entries(a))n.startsWith('on')?e.addEventListener(n.slice(2),v):e.setAttribute(n,v);e.append(...k.flat().filter(c=>c!=null));return e};
+const app=$('#app');
+let rt=0,pl=null,party=null,ign=0;
+
+let addons=(()=>{try{const a=JSON.parse(localStorage.getItem('addons'));if(a&&a.length)return a}catch{}return[{base:'https://v3-cinemeta.strem.io',m:null}]})();
+const save=()=>{try{localStorage.setItem('addons',JSON.stringify(addons))}catch{}};
+const toBase=u=>u.trim().replace(/^stremio:\/\//,'https://').replace(/\/manifest\.json.*$/,'').replace(/\/$/,'');
+const get=async(b,p)=>{const r=await fetch(b+p);if(!r.ok)throw new Error('HTTP '+r.status);return r.json()};
+const refresh=a=>get(a.base,'/manifest.json').then(m=>{a.m=m;save()});
+const msg=t=>h('p',{class:'mut'},t);
+const ls=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}};
+const sv=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}};
+let fav=ls('fav',[]),hist=ls('hist',[]),pos=ls('pos',{}),done=ls('done',{});
+const fmt=s=>{s=Math.floor(s);const m=Math.floor(s/60),r=String(s%60).padStart(2,'0');return m>=60?`${Math.floor(m/60)}:${String(m%60).padStart(2,'0')}:${r}`:`${m}:${r}`};
+const wcard=(m,p)=>{const c=card(m);c.append(h('div',{style:`height:4px;border-radius:2px;margin-top:4px;background:linear-gradient(90deg,var(--ac) ${p*100}%,var(--card) 0)`}));return c};
+
+const can=(a,name,type,id)=>(a.m?.resources||[]).some(r=>{
+  const n=typeof r=='string'?r:r.name;if(n!=name)return false;
+  const types=r.types||a.m.types||[],pre=r.idPrefixes||a.m.idPrefixes;
+  return(!type||types.includes(type))&&(!pre||!id||pre.some(p=>id.startsWith(p)))});
+
+const card=m=>h('div',{class:'card',tabindex:0,
+  onclick:()=>location.hash=`#/m/${m.type}/${encodeURIComponent(m.id)}`,
+  onkeydown:e=>{if(e.key=='Enter')e.currentTarget.click()}},
+  h('img',{src:m.poster||'',alt:'',loading:'lazy'}),h('div',{class:'t'},m.name||m.id));
+
+async function home(){
+  const tk=rt;
+  const cats=addons.flatMap(a=>(a.m?.catalogs||[])
+    .filter(c=>!(c.extra||[]).some(x=>x.isRequired)&&!(c.extraRequired||[]).length)
+    .map(c=>({a,c}))).slice(0,8);
+  if(!cats.length)return app.replaceChildren(msg('No catalogs yet. Add an addon in the Addons tab.'));
+  app.replaceChildren();
+  if(hist.length)app.append(h('h2',{},'Continue watching'),h('div',{class:'row'},...hist.slice(0,15).map(x=>wcard(x,x.d?x.t/x.d:0))));
+  if(fav.length)app.append(h('h2',{},'My list'),h('div',{class:'row'},...fav.map(m=>card(m))));
+  for(const{a,c}of cats){
+    const row=h('div',{class:'row'});
+    app.append(h('h2',{},`${c.name||c.id} (${c.type})`),row);
+    get(a.base,`/catalog/${c.type}/${c.id}.json`)
+      .then(r=>{if(tk==rt)row.append(...(r.metas||[]).slice(0,30).map(card))})
+      .catch(()=>row.append(msg('Couldn’t load this row.')));
+  }
+}
+
+async function search(q){
+  q=q||'';$('#q').value=q;const tk=rt;
+  const cats=addons.flatMap(a=>(a.m?.catalogs||[])
+    .filter(c=>(c.extra||[]).some(x=>x.name=='search')||(c.extraSupported||[]).includes('search'))
+    .map(c=>({a,c})));
+  const grid=h('div',{class:'grid'}),seen=new Set();
+  app.replaceChildren(h('h2',{},`Results for “${q}”`),grid);
+  if(!cats.length)return grid.append(msg('None of your addons support search.'));
+  let n=0;
+  await Promise.allSettled(cats.map(({a,c})=>get(a.base,`/catalog/${c.type}/${c.id}/search=${encodeURIComponent(q)}.json`).then(r=>{
+    if(tk!=rt)return;
+    for(const m of r.metas||[]){const k=m.type+m.id;if(seen.has(k))continue;seen.add(k);n++;grid.append(card(m))}
+  })));
+  if(tk==rt&&!n)grid.append(msg('Nothing found. Try another spelling.'));
+}
+
+async function streams(type,vid){
+  const list=addons.filter(a=>can(a,'stream',type,vid));
+  const rs=await Promise.allSettled(list.map(a=>get(a.base,`/stream/${type}/${vid}.json`)));
+  return rs.flatMap(r=>r.status=='fulfilled'?(r.value.streams||[]):[]);
+}
+
+async function detail(type,id){
+  const tk=rt,a=addons.find(a=>can(a,'meta',type,id));
+  let m={id,type,name:id};
+  if(a){try{m=(await get(a.base,`/meta/${type}/${encodeURIComponent(id)}.json`)).meta||m}catch{}}
+  if(tk!=rt)return;
+  const box=h('div',{class:'stack'}),eps=h('div',{class:'stack'});
+  const lab=v=>`S${v.season??0}E${v.episode??v.number??0}`;
+  const ctx=(vid,s)=>{
+    const o=(m.videos||[]).filter(v=>v.id).sort((x,y)=>(x.season??0)-(y.season??0)||(x.episode??x.number??0)-(y.episode??y.number??0));
+    const i=o.findIndex(v=>v.id==vid),cur=o[i],nx=type=='series'&&i>=0?o[i+1]:null;
+    return{m:{id,type,name:m.name,poster:m.poster},vid,type,s,lab:cur?lab(cur):'',title:m.name+(cur?' '+lab(cur):''),
+      nx:nx&&{id:nx.id,lab:lab(nx)},
+      next:nx&&(async()=>{const ss=(await streams(type,nx.id)).filter(x=>x.url),x=ss.find(y=>y.name==s.name)||ss[0];
+        if(!x)return null;const c=ctx(nx.id,x);return[x.url,c.title,c]})};
+  };
+  const show=async vid=>{
+    box.replaceChildren(msg('Finding streams…'));box.scrollIntoView({behavior:'smooth',block:'center'});
+    const ss=await streams(type,vid);
+    if(!ss.length)return box.replaceChildren(msg('No streams from your addons for this one.'));
+    box.replaceChildren(...ss.map(s=>{
+      const t=[s.name,s.title||s.description].filter(Boolean).join('\n')||'Stream';
+      if(s.url)return h('button',{class:'st',onclick:()=>{const c=ctx(vid,s);play(s.url,c.title,c)}},'▶ '+t);
+      if(s.externalUrl)return h('a',{class:'st',href:s.externalUrl,target:'_blank',rel:'noopener'},'Open link\n'+t);
+      return h('div',{class:'st off'},t+'\nNeeds a torrent client, which this app doesn’t include.');
+    }));
+    box.querySelector('button')?.focus();
+  };
+  const vids=(m.videos||[]).filter(v=>v.id);
+  if(type=='series'&&vids.length){
+    const seasons=[...new Set(vids.map(v=>v.season??0))].sort((x,y)=>x-y);
+    let cur=seasons.find(s=>s>0)??seasons[0];
+    const sb=h('div',{class:'row',style:'padding:0'}),list=h('div',{class:'stack',style:'padding:0'});
+    const draw=focus=>{
+      sb.replaceChildren(...seasons.map(s=>h('button',{class:s==cur?'on':'',onclick:()=>{cur=s;draw(true)}},s?'Season '+s:'Specials')));
+      list.replaceChildren(...vids.filter(v=>(v.season??0)==cur)
+        .sort((x,y)=>(x.episode??x.number??0)-(y.episode??y.number??0))
+        .map(v=>h('button',{onclick:()=>show(v.id)},`${done[v.id]?'✓ ':''}${v.episode??v.number??''}  ${v.title||v.name||'Episode'}`)));
+      if(focus)sb.querySelector('.on')?.focus();
+    };
+    draw();eps.append(sb,list);
+  }else eps.append(h('button',{class:'pri',onclick:()=>show(id)},'▶ Watch'));
+  const cont=hist.find(x=>x.id==id),inList=()=>fav.some(f=>f.id==id);
+  const cb=cont&&h('button',{class:'pri',onclick:()=>show(cont.vid)},`Continue ${cont.lab||''}${cont.t>20?' at '+fmt(cont.t):''}`.replace(/\s+/g,' '));
+  const rb=cont&&h('button',{onclick:()=>{hist=hist.filter(x=>x.id!=id);sv('hist',hist);rb.remove();cb.remove()}},'Remove from continue');
+  const fb=h('button',{onclick:()=>{fav=inList()?fav.filter(f=>f.id!=id):[{id,type,name:m.name,poster:m.poster},...fav];sv('fav',fav);fb.textContent=inList()?'✓ In my list':'+ My list'}},inList()?'✓ In my list':'+ My list');
+  const meta=[m.releaseInfo,m.runtime,m.imdbRating&&'IMDb '+m.imdbRating,(m.genres||[]).join(', ')].filter(Boolean).join(', ');
+  app.replaceChildren(
+    h('div',{class:'hero'},h('img',{src:m.poster||'',alt:''}),
+      h('div',{class:'info'},h('h1',{},m.name||id),h('div',{class:'mut',style:'margin:0 0 10px'},meta),h('div',{class:'bar'},cb,fb,rb),h('p',{},m.description||''))),
+    eps,h('h2',{},'Streams'),box);
+  (cb||eps.querySelector('button.pri')||eps.querySelector('button'))?.focus({preventScroll:true});
+}
+
+async function addonsView(){
+  const inp=h('input',{type:'url',placeholder:'Paste an addon manifest link'}),st=msg(''),list=h('div');
+  const draw=()=>list.replaceChildren(...addons.map((a,i)=>h('div',{class:'ad'},
+    h('div',{},h('b',{},a.m?.name||a.base),
+      h('div',{class:'mut',style:'margin:0'},a.m?(a.m.resources||[]).map(r=>r.name||r).join(', '):'Couldn’t load the manifest')),
+    h('button',{onclick:()=>{addons.splice(i,1);save();draw()}},'Remove'))));
+  const add=async()=>{
+    try{
+      st.textContent='Adding…';const b=toBase(inp.value);
+      if(!addons.some(a=>a.base==b)){const m=await get(b,'/manifest.json');addons.push({base:b,m});save()}
+      inp.value='';st.textContent='Added.';draw();
+    }catch(e){st.textContent='Couldn’t load that manifest ('+e.message+'). Check the link.'}
+  };
+  const bk=h('textarea',{rows:3,placeholder:'Paste a backup here to restore it'});
+  const copyB=h('button',{onclick:async()=>{
+    const t=JSON.stringify({a:addons.map(a=>a.base),fav,hist,pos,done});
+    try{await navigator.clipboard.writeText(t);st.textContent='Backup copied. Paste it on your other device.'}
+    catch{bk.value=t;st.textContent='Copy the text from the box.'}}},'Copy backup');
+  const resB=h('button',{onclick:async()=>{
+    try{
+      const d=JSON.parse(bk.value);addons=d.a.map(b=>({base:b,m:null}));
+      await Promise.allSettled(addons.map(refresh));
+      fav=d.fav||[];hist=d.hist||[];pos=d.pos||{};done=d.done||{};
+      save();sv('fav',fav);sv('hist',hist);sv('pos',pos);sv('done',done);
+      st.textContent='Restored.';draw();
+    }catch{st.textContent='That backup isn’t valid.'}}},'Restore');
+  app.replaceChildren(h('h2',{},'Addons'),h('div',{class:'add'},inp,h('button',{class:'pri',onclick:add},'Add')),st,list,
+    msg('Streams with a direct video link play here. Torrent-only streams can’t play in a web app.'),
+    h('h2',{},'Backup'),h('div',{class:'add'},copyB,resB),h('div',{class:'add',style:'margin-top:8px'},bk));
+  draw();
+}
+
+const loadPeer=()=>window.Peer?Promise.resolve():new Promise((ok,no)=>document.head.append(h('script',{src:'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js',onload:ok,onerror:()=>no(new Error('Couldn’t load the party library. Check your internet.'))})));
+const toast=t=>{const d=h('div',{class:'toast'},t);document.body.append(d);setTimeout(()=>d.remove(),2500)};
+const redraw=()=>{if(location.hash=='#/party')route()};
+function send(m,from){if(party)for(const c of party.conns)if(c!==from&&c.open)c.send(m)}
+function applySync(m){
+  const v=pl&&pl.querySelector('video');if(!v)return;
+  ign=Date.now()+800;
+  if(Math.abs(v.currentTime-m.time)>1.5)v.currentTime=m.time;
+  if(m.state=='play')v.play().catch(()=>{});else v.pause();
+}
+function onMsg(m,from){
+  if(!party||!m)return;
+  if(party.host&&m.t!='ask')send(m,from);
+  if(m.t=='play'){party.cur=m;play(m.url,m.title,{rem:1},!!pl)}
+  else if(m.t=='sync')applySync(m);
+  else if(m.t=='emo')toast(m.e);
+  else if(m.t=='ask'){const v=pl&&pl.querySelector('video');if(v)from.send({t:'sync',state:v.paused?'pause':'play',time:v.currentTime})}
+}
+function wire(c){
+  party.conns.push(c);
+  c.on('data',m=>onMsg(m,c));
+  const hi=()=>{toast('Someone joined');if(party.cur)c.send(party.cur);redraw()};
+  c.open?hi():c.on('open',hi);
+  c.on('close',()=>{if(!party)return;party.conns=party.conns.filter(x=>x!==c);toast('Someone left');redraw()});
+}
+function hostRoom(say){
+  loadPeer().then(()=>{
+    const cd=Array.from({length:4},()=>'ABCDEFGHJKMNPQRSTUVWXYZ23456789'[Math.random()*31|0]).join('');
+    const peer=new Peer('strmwp-'+cd);
+    peer.on('open',()=>{party={peer,host:true,code:cd,conns:[]};redraw()});
+    peer.on('connection',wire);
+    peer.on('error',e=>e.type=='unavailable-id'?hostRoom(say):say('Couldn’t start the room ('+e.type+').'));
+  }).catch(e=>say(e.message));
+}
+function joinRoom(cd,say){
+  cd=cd.trim().toUpperCase();if(cd.length!=4)return say('Enter the 4-letter code.');
+  say('Joining…');
+  loadPeer().then(()=>{
+    const peer=new Peer();
+    peer.on('open',()=>{
+      const c=peer.connect('strmwp-'+cd,{reliable:true});
+      c.on('open',()=>{party={peer,host:false,code:cd,conns:[c]};c.on('data',m=>onMsg(m,c));c.on('close',()=>{toast('The host left the room.');leave()});redraw()});
+    });
+    peer.on('error',e=>say(e.type=='peer-unavailable'?'No room with that code.':'Couldn’t join ('+e.type+').'));
+  }).catch(e=>say(e.message));
+}
+function leave(){if(party){party.peer.destroy();party=null}redraw()}
+function partyView(){
+  const st=msg(''),say=t=>{st.textContent=t},inp=h('input',{placeholder:'4-letter code',maxlength:4});
+  if(party)app.replaceChildren(h('h2',{},'Watch party'),
+    h('div',{class:'ad'},h('div',{},h('b',{},'Room '+party.code),
+      h('div',{class:'mut',style:'margin:0'},party.host?`${party.conns.length+1} watching. Start any stream and everyone follows.`:'Connected. Start a stream or wait for someone to start one.')),
+      h('button',{onclick:leave},'Leave')),
+    msg(party.host?'Friends open this app, tap Party, and enter the code. Play, pause and seeking stay in sync.':'Play, pause and seeking stay in sync with the room.'));
+  else app.replaceChildren(h('h2',{},'Watch party'),
+    h('div',{class:'add'},h('button',{class:'pri',onclick:()=>{say('Starting…');hostRoom(say)}},'Start a room')),
+    h('h2',{},'Join a room'),h('div',{class:'add'},inp,h('button',{class:'pri',onclick:()=>joinRoom(inp.value,say)},'Join')),st);
+}
+
+async function subs(v,ctx,btn){
+  const by={};
+  for(const a of addons.filter(a=>can(a,'subtitles',ctx.type,ctx.vid)))
+    try{for(const x of(await get(a.base,`/subtitles/${ctx.type}/${ctx.vid}.json`)).subtitles||[])if(!by[x.lang])by[x.lang]=x}catch{}
+  const langs=Object.keys(by).sort((x,y)=>(y=='eng')-(x=='eng')||x.localeCompare(y)).slice(0,8);
+  if(!langs.length)return;
+  let i=langs.length;btn.hidden=false;
+  btn.onclick=async()=>{
+    v.querySelectorAll('track').forEach(t=>t.remove());
+    i=(i+1)%(langs.length+1);
+    if(i==langs.length){btn.textContent='Subtitles: off';return}
+    const l=langs[i];btn.textContent='Subtitles: '+l+'…';
+    try{
+      let t=await(await fetch(by[l].url)).text();
+      if(!t.startsWith('WEBVTT'))t='WEBVTT\n\n'+t.replace(/(\d+:\d+:\d+),(\d+)/g,'$1.$2');
+      const k=h('track',{kind:'subtitles',label:l,src:URL.createObjectURL(new Blob([t],{type:'text/vtt'}))});
+      v.append(k);k.track.mode='showing';btn.textContent='Subtitles: '+l;
+    }catch{btn.textContent='Subtitles: '+l+' failed'}
+  };
+}
+
+function play(url,title,ctx={},swap){
+  if(pl&&!swap)return;
+  if(pl){pl._save?.();pl.querySelector('video')._h?.destroy();pl.remove()}
+  if(party&&!ctx.rem){party.cur={t:'play',url,title};send(party.cur)}
+  const v=h('video',{controls:'',autoplay:'',playsinline:'',tabindex:0}),err=h('div',{class:'err'});
+  const sb=h('button',{class:'x s',hidden:''},'Subtitles: off');
+  const top=h('div',{class:'top'},
+    ...(party?['❤️','😂','😮','👏'].map(e=>h('button',{class:'x',onclick:()=>{send({t:'emo',e});toast(e)}},e)):[]),
+    sb,h('button',{class:'x',onclick:()=>{v.currentTime+=85}},'Skip 85s'),
+    h('button',{class:'x',onclick:()=>history.back()},'Close'));
+  const me=pl=h('div',{id:'pl'},top,h('div',{class:'ttl'},title||''),v,err);
+  document.body.append(me);if(!swap)history.pushState({p:1},'');
+  const vid=ctx.vid;let last=0;
+  const saveP=()=>{
+    if(!vid||!v.duration||isNaN(v.duration))return;
+    pos[vid]=v.currentTime;sv('pos',pos);
+    const rest=hist.filter(x=>x.id!=ctx.m.id);
+    if(v.currentTime/v.duration>.92){
+      done[vid]=1;sv('done',done);
+      hist=ctx.nx?[{...ctx.m,vid:ctx.nx.id,lab:ctx.nx.lab,t:0,d:0},...rest]:rest;
+    }else hist=[{...ctx.m,vid,lab:ctx.lab,t:v.currentTime,d:v.duration},...rest].slice(0,20);
+    sv('hist',hist);
+  };
+  me._save=saveP;
+  v.ontimeupdate=()=>{if(Date.now()-last>5000){last=Date.now();saveP()}};
+  v.onpause=saveP;
+  if(party){
+    const ev=st=>()=>{if(Date.now()<ign)return;send({t:'sync',state:st||(v.paused?'pause':'play'),time:v.currentTime})};
+    v.addEventListener('play',ev('play'));v.addEventListener('pause',ev('pause'));v.addEventListener('seeked',ev());
+  }
+  v.onloadedmetadata=()=>{const q=pos[vid];if(q>20&&q<v.duration*.92)v.currentTime=q;if(party&&ctx.rem&&!party.host)party.conns[0].send({t:'ask'})};
+  v.onended=()=>{
+    saveP();if(!ctx.next)return;
+    let n=8;const b=h('button',{class:'pri nx'},'');
+    const t=setInterval(()=>{if(!b.isConnected)return clearInterval(t);b.textContent=`Next episode in ${n}s (OK to play now)`;if(!n--)b.click()},1000);
+    b.onclick=async()=>{clearInterval(t);b.disabled=true;const r=await ctx.next();if(r)play(r[0],r[1],r[2],true);else{b.remove();err.textContent='No playable stream found for the next episode.'}};
+    me.append(b);b.focus();
+  };
+  v.onerror=()=>{err.textContent='This stream won’t play. It may be blocked, in an unsupported format, or an http link on an https page.'};
+  if(/\.m3u8(\?|$)/i.test(url)&&!v.canPlayType('application/vnd.apple.mpegurl')){
+    const go=()=>{if(!window.Hls||!Hls.isSupported())return v.onerror();const H=new Hls();H.loadSource(url);H.attachMedia(v);v._h=H};
+    window.Hls?go():document.head.append(h('script',{src:'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.17/hls.min.js',onload:go}));
+  }else v.src=url;
+  if(vid)subs(v,ctx,sb);
+  v.focus();
+}
+
+async function route(){
+  rt++;
+  const p=(location.hash.slice(1)||'/').split('/').map(decodeURIComponent);
+  app.replaceChildren(msg('Loading…'));
+  try{
+    if(p[1]=='addons')await addonsView();
+    else if(p[1]=='party')partyView();
+    else if(p[1]=='s')await search(p[2]);
+    else if(p[1]=='m')await detail(p[2],p[3]);
+    else await home();
+  }catch(e){app.replaceChildren(msg('Something went wrong: '+e.message))}
+  scrollTo(0,0);
+}
+
+$('#sf').addEventListener('submit',e=>{e.preventDefault();const q=$('#q').value.trim();if(q)location.hash='#/s/'+encodeURIComponent(q)});
+addEventListener('hashchange',route);
+addEventListener('popstate',()=>{if(pl){pl._save?.();pl.querySelector('video')._h?.destroy();pl.remove();pl=null}});
+
+// Remote and keyboard: arrows move focus, Enter selects, Back closes the player
+addEventListener('keydown',e=>{
+  if(pl){
+    const v=pl.querySelector('video'),a=document.activeElement,onV=a==v||a==document.body;
+    if(['Escape','Backspace','GoBack'].includes(e.key)){e.preventDefault();history.back()}
+    else if(e.key=='ArrowUp'&&onV){(pl.querySelector('.s:not([hidden])')||pl.querySelector('.x')).focus();e.preventDefault()}
+    else if(e.key=='ArrowDown'&&!onV){v.focus();e.preventDefault()}
+    else if(!onV&&(e.key=='ArrowLeft'||e.key=='ArrowRight')&&a.classList.contains('x')){const b=[...pl.querySelectorAll('.x:not([hidden])')];b[(b.indexOf(a)+1)%b.length].focus();e.preventDefault()}
+    else if(onV&&e.key=='ArrowLeft'){v.currentTime-=10;e.preventDefault()}
+    else if(onV&&e.key=='ArrowRight'){v.currentTime+=10;e.preventDefault()}
+    else if(e.key=='Enter'&&a==v){v.paused?v.play():v.pause();e.preventDefault()}
+    return;
+  }
+  const d={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[e.key];
+  if(!d||(['INPUT','TEXTAREA'].includes(e.target.tagName)&&d[0]))return;
+  const els=[...document.querySelectorAll('button,[tabindex="0"],input,textarea,a[href]')].filter(x=>x.offsetParent);
+  const cur=document.activeElement;
+  if(!els.includes(cur)){els[0]?.focus();e.preventDefault();return}
+  const r=cur.getBoundingClientRect(),cx=r.x+r.width/2,cy=r.y+r.height/2;
+  let best=null,bs=1e9;
+  for(const x of els){
+    if(x==cur)continue;
+    const q=x.getBoundingClientRect(),dx=q.x+q.width/2-cx,dy=q.y+q.height/2-cy,along=dx*d[0]+dy*d[1];
+    if(along<=1)continue;
+    const s=along+2*(Math.abs(dx*d[1])+Math.abs(dy*d[0]));
+    if(s<bs){bs=s;best=x}
+  }
+  if(best){best.focus({preventScroll:true});best.scrollIntoView({block:'center',inline:'center'});e.preventDefault()}
+});
+
+(async()=>{
+  const p=Promise.allSettled(addons.map(refresh));
+  if(!addons.every(a=>a.m))await p;
+  route();
+})();
+</script>
+</body>
+</html>
