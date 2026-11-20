@@ -1,8 +1,12 @@
 package com.streamer.app
 
 import android.content.Context
+import android.webkit.CookieManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
@@ -15,7 +19,8 @@ data class CatalogDef(
     val id: String,
     val name: String,
     val hasSearch: Boolean,
-    val extraRequired: Boolean
+    val extraRequired: Boolean,
+    val genres: List<String> = emptyList()
 )
 
 data class Addon(
@@ -26,6 +31,21 @@ data class Addon(
     val idPrefixes: List<String>? = null,
     val catalogs: List<CatalogDef> = emptyList(),
     val loaded: Boolean = false
+)
+
+data class JsPlugin(
+    val id: String,
+    val name: String,
+    val version: String,
+    val scriptUrl: String,
+    val repoUrl: String,
+    val enabled: Boolean = true
+)
+
+data class CsPluginInfo(
+    val name: String,
+    val url: String,
+    val tvTypes: String
 )
 
 data class VideoEp(
@@ -49,7 +69,8 @@ data class MetaItem(
     val imdbRating: String? = null,
     val genres: List<String> = emptyList(),
     val videos: List<VideoEp> = emptyList(),
-    val source: String? = null
+    val source: String? = null,
+    val tmdbId: String? = null
 )
 
 data class StreamItem(
@@ -62,16 +83,14 @@ data class StreamItem(
     val headers: Map<String, String> = emptyMap()
 )
 
-data class SubItem(
-    val url: String,
-    val lang: String,
-    val id: String
-)
+data class SubItem(val url: String, val lang: String, val id: String)
+data class SubCue(val startMs: Long, val endMs: Long, val text: String)
 
-data class SubCue(
-    val startMs: Long,
-    val endMs: Long,
-    val text: String
+data class SubPrefs(
+    val sizeSp: Int = 18,
+    val colorHex: Long = 0xFFFFFFFF,
+    val bgStyle: Int = 0, // 0=Box, 1=Outline, 2=Clear
+    val bottomDp: Int = 24
 )
 
 data class HistoryItem(
@@ -85,8 +104,31 @@ data class HistoryItem(
     val durMs: Long
 )
 
+class WebViewCookieJar : CookieJar {
+    private val cm: CookieManager? get() = runCatching { CookieManager.getInstance() }.getOrNull()
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        val m = cm ?: return
+        cookies.forEach { m.setCookie(url.toString(), it.toString()) }
+        m.flush()
+    }
+    override fun loadForRequest(url: HttpUrl): List<Cookie> {
+        val raw = cm?.getCookie(url.toString()) ?: return emptyList()
+        return raw.split(";").mapNotNull { part ->
+            val eq = part.indexOf('=')
+            if (eq <= 0) null else Cookie.Builder()
+                .name(part.substring(0, eq).trim())
+                .value(part.substring(eq + 1).trim())
+                .domain(url.host)
+                .build()
+        }
+    }
+}
+
 object Engine {
+    @Volatile var userAgent: String = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
     val http: OkHttpClient = OkHttpClient.Builder()
+        .cookieJar(WebViewCookieJar())
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .followRedirects(true)
@@ -101,7 +143,7 @@ object Engine {
         .trimEnd('/')
 
     suspend fun fetchText(url: String): String = withContext(Dispatchers.IO) {
-        val req = Request.Builder().url(url).header("User-Agent", "StreamerAndroid/1.0").build()
+        val req = Request.Builder().url(url).header("User-Agent", userAgent).build()
         http.newCall(req).execute().use { res ->
             if (!res.isSuccessful) error("HTTP ${res.code}")
             res.body?.string() ?: ""
@@ -109,8 +151,7 @@ object Engine {
     }
 
     suspend fun fetchManifest(base: String): Addon {
-        val txt = fetchText("$base/manifest.json")
-        val j = JSONObject(txt)
+        val j = JSONObject(fetchText("$base/manifest.json"))
         val types = j.optJSONArray("types").toStringList()
         val prefixes = j.optJSONArray("idPrefixes")?.toStringList()
         val cats = mutableListOf<CatalogDef>()
@@ -120,19 +161,23 @@ object Engine {
             val extras = c.optJSONArray("extra") ?: JSONArray()
             var hasSearch = false
             var reqExtra = (c.optJSONArray("extraRequired")?.length() ?: 0) > 0
+            val genres = mutableListOf<String>()
             for (k in 0 until extras.length()) {
                 val ex = extras.optJSONObject(k) ?: continue
                 if (ex.optString("name") == "search") hasSearch = true
                 if (ex.optBoolean("isRequired")) reqExtra = true
+                if (ex.optString("name") == "genre") {
+                    genres += ex.optJSONArray("options").toStringList()
+                }
             }
-            val sup = c.optJSONArray("extraSupported").toStringList()
-            if ("search" in sup) hasSearch = true
+            if ("search" in c.optJSONArray("extraSupported").toStringList()) hasSearch = true
             cats += CatalogDef(
                 type = c.optString("type"),
                 id = c.optString("id"),
                 name = c.optString("name").ifBlank { c.optString("id") },
                 hasSearch = hasSearch,
-                extraRequired = reqExtra
+                extraRequired = reqExtra,
+                genres = genres
             )
         }
         return Addon(
@@ -144,6 +189,51 @@ object Engine {
             catalogs = cats,
             loaded = true
         )
+    }
+
+    suspend fun fetchJsRepo(repoUrl: String): List<JsPlugin> {
+        val clean = repoUrl.trim()
+        val j = JSONObject(fetchText(clean))
+        val arr = j.optJSONArray("scrapers") ?: j.optJSONArray("providers") ?: j.optJSONArray("plugins") ?: JSONArray()
+        val baseDir = clean.substringBeforeLast('/')
+        val out = mutableListOf<JsPlugin>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val fn = o.optString("filename").ifBlank { o.optString("url") }.ifBlank { o.optString("file") }
+            if (fn.isBlank()) continue
+            val scriptUrl = if (fn.startsWith("http", true)) fn else "$baseDir/${fn.trimStart('/')}"
+            out += JsPlugin(
+                id = o.optString("id").ifBlank { o.optString("name") },
+                name = o.optString("name").ifBlank { o.optString("id") },
+                version = o.optString("version", "1.0"),
+                scriptUrl = scriptUrl,
+                repoUrl = clean,
+                enabled = true
+            )
+        }
+        return out
+    }
+
+    suspend fun inspectCloudStreamRepo(rawUrl: String): Pair<String, List<CsPluginInfo>> {
+        val url = rawUrl.trim().replace(Regex("^cloudstreamrepo://", RegexOption.IGNORE_CASE), "https://")
+        val j = JSONObject(fetchText(url))
+        val repoName = j.optString("name").ifBlank { "CloudStream Repo" }
+        val lists = j.optJSONArray("pluginLists").toStringList()
+        val plugins = mutableListOf<CsPluginInfo>()
+        for (plUrl in lists.take(3)) {
+            runCatching {
+                val arr = JSONArray(fetchText(plUrl))
+                for (i in 0 until arr.length()) {
+                    val p = arr.optJSONObject(i) ?: continue
+                    plugins += CsPluginInfo(
+                        name = p.optString("name").ifBlank { p.optString("internalName") },
+                        url = p.optString("url"),
+                        tvTypes = p.optJSONArray("tvTypes").toStringList().joinToString(", ")
+                    )
+                }
+            }
+        }
+        return repoName to plugins
     }
 
     fun can(a: Addon, resName: String, type: String? = null, id: String? = null): Boolean {
@@ -162,12 +252,20 @@ object Engine {
         return false
     }
 
-    suspend fun fetchCatalog(base: String, type: String, id: String, query: String? = null): List<MetaItem> {
-        val path = if (query == null) {
-            "/catalog/${enc(type)}/${enc(id)}.json"
-        } else {
-            "/catalog/${enc(type)}/${enc(id)}/search=${enc(query)}.json"
-        }
+    suspend fun fetchCatalog(
+        base: String,
+        type: String,
+        id: String,
+        query: String? = null,
+        genre: String? = null,
+        skip: Int = 0
+    ): List<MetaItem> {
+        val extras = mutableListOf<String>()
+        if (!query.isNullOrBlank()) extras += "search=${enc(query)}"
+        if (!genre.isNullOrBlank() && genre != "All") extras += "genre=${enc(genre)}"
+        if (skip > 0) extras += "skip=$skip"
+        val path = if (extras.isEmpty()) "/catalog/${enc(type)}/${enc(id)}.json"
+        else "/catalog/${enc(type)}/${enc(id)}/${extras.joinToString("&")}.json"
         val j = JSONObject(fetchText(base + path))
         val arr = j.optJSONArray("metas") ?: return emptyList()
         return List(arr.length()) { i -> parseMeta(arr.optJSONObject(i)) }.filterNotNull()
@@ -229,8 +327,7 @@ object Engine {
     }
 
     fun parseSubtitles(txt: String): List<SubCue> {
-        val clean = txt.removePrefix("\uFEFF")
-        val blocks = clean.split(Regex("\\r?\\n\\s*\\r?\\n"))
+        val blocks = txt.removePrefix("\uFEFF").split(Regex("\\r?\\n\\s*\\r?\\n"))
         val cues = mutableListOf<SubCue>()
         for (blk in blocks) {
             val lines = blk.trim().split(Regex("\\r?\\n"))
@@ -241,9 +338,7 @@ object Engine {
             val start = parseSubMs(parts[0])
             val end = parseSubMs(parts[1].trim().split(" ").first())
             val body = lines.drop(idx + 1).joinToString("\n")
-                .replace(Regex("<[^>]+>"), "")
-                .replace(Regex("\\{\\\\[^}]+\\}"), "")
-                .trim()
+                .replace(Regex("<[^>]+>"), "").replace(Regex("\\{\\\\[^}]+\\}"), "").trim()
             if (body.isNotBlank() && end > start) cues += SubCue(start, end, body)
         }
         return cues
@@ -263,7 +358,6 @@ object Engine {
     private fun parseMeta(j: JSONObject?): MetaItem? {
         j ?: return null
         val id = j.optString("id")
-        val type = j.optString("type")
         if (id.isBlank()) return null
         val vids = mutableListOf<VideoEp>()
         val va = j.optJSONArray("videos") ?: JSONArray()
@@ -280,9 +374,10 @@ object Engine {
                 overview = v.optString("overview").ifBlank { null }
             )
         }
+        val tmdb = j.opt("moviedb_id")?.toString()?.takeIf { it.isNotBlank() && it != "0" && it != "null" }
         return MetaItem(
             id = id,
-            type = type.ifBlank { "movie" },
+            type = j.optString("type").ifBlank { "movie" },
             name = j.optString("name").ifBlank { id },
             poster = j.optString("poster").ifBlank { null },
             background = j.optString("background").ifBlank { null },
@@ -291,7 +386,8 @@ object Engine {
             runtime = j.optString("runtime").ifBlank { null },
             imdbRating = j.optString("imdbRating").ifBlank { null },
             genres = j.optJSONArray("genres").toStringList(),
-            videos = vids.sortedWith(compareBy({ it.season }, { it.episode }))
+            videos = vids.sortedWith(compareBy({ it.season }, { it.episode })),
+            tmdbId = tmdb
         )
     }
 
@@ -310,9 +406,21 @@ class Store(ctx: Context) {
         val list = List(arr.length()) { arr.optString(it) }.filter { it.isNotBlank() }
         return list.ifEmpty { listOf("https://v3-cinemeta.strem.io") }
     }
+    fun saveAddonBases(bases: List<String>) = sp.edit().putString("addons", JSONArray(bases).toString()).apply()
 
-    fun saveAddonBases(bases: List<String>) {
-        sp.edit().putString("addons", JSONArray(bases).toString()).apply()
+    fun getJsPlugins(): List<JsPlugin> {
+        val arr = runCatching { JSONArray(sp.getString("js_plugins", "[]")) }.getOrNull() ?: return emptyList()
+        return List(arr.length()) { i ->
+            val o = arr.optJSONObject(i) ?: return@List null
+            JsPlugin(o.optString("id"), o.optString("name"), o.optString("ver"), o.optString("url"), o.optString("repo"), o.optBoolean("on", true))
+        }.filterNotNull()
+    }
+    fun saveJsPlugins(list: List<JsPlugin>) {
+        val arr = JSONArray()
+        list.forEach {
+            arr.put(JSONObject().put("id", it.id).put("name", it.name).put("ver", it.version).put("url", it.scriptUrl).put("repo", it.repoUrl).put("on", it.enabled))
+        }
+        sp.edit().putString("js_plugins", arr.toString()).apply()
     }
 
     fun getFavs(): List<MetaItem> {
@@ -322,12 +430,9 @@ class Store(ctx: Context) {
             MetaItem(o.optString("id"), o.optString("type"), o.optString("name"), o.optString("poster").ifBlank { null }, imdbRating = o.optString("rate").ifBlank { null })
         }.filterNotNull()
     }
-
     fun saveFavs(list: List<MetaItem>) {
         val arr = JSONArray()
-        list.forEach {
-            arr.put(JSONObject().put("id", it.id).put("type", it.type).put("name", it.name).put("poster", it.poster ?: "").put("rate", it.imdbRating ?: ""))
-        }
+        list.forEach { arr.put(JSONObject().put("id", it.id).put("type", it.type).put("name", it.name).put("poster", it.poster ?: "").put("rate", it.imdbRating ?: "")) }
         sp.edit().putString("favs", arr.toString()).apply()
     }
 
@@ -338,13 +443,20 @@ class Store(ctx: Context) {
             HistoryItem(o.optString("id"), o.optString("type"), o.optString("name"), o.optString("poster").ifBlank { null }, o.optString("vid"), o.optString("lab"), o.optLong("pos"), o.optLong("dur"))
         }.filterNotNull()
     }
-
     fun saveHistory(list: List<HistoryItem>) {
         val arr = JSONArray()
-        list.take(25).forEach {
-            arr.put(JSONObject().put("id", it.id).put("type", it.type).put("name", it.name).put("poster", it.poster ?: "").put("vid", it.vid).put("lab", it.lab).put("pos", it.posMs).put("dur", it.durMs))
-        }
+        list.take(25).forEach { arr.put(JSONObject().put("id", it.id).put("type", it.type).put("name", it.name).put("poster", it.poster ?: "").put("vid", it.vid).put("lab", it.lab).put("pos", it.posMs).put("dur", it.durMs)) }
         sp.edit().putString("hist", arr.toString()).apply()
+    }
+
+    fun getSubPrefs(): SubPrefs = SubPrefs(
+        sizeSp = sp.getInt("sub_sz", 18),
+        colorHex = sp.getLong("sub_col", 0xFFFFFFFF),
+        bgStyle = sp.getInt("sub_bg", 0),
+        bottomDp = sp.getInt("sub_pos", 24)
+    )
+    fun saveSubPrefs(p: SubPrefs) {
+        sp.edit().putInt("sub_sz", p.sizeSp).putLong("sub_col", p.colorHex).putInt("sub_bg", p.bgStyle).putInt("sub_pos", p.bottomDp).apply()
     }
 
     fun getPos(vid: String): Long = sp.getLong("pos_$vid", 0L)
@@ -356,9 +468,23 @@ class Store(ctx: Context) {
         val arr = runCatching { JSONArray(sp.getString("rec_q", "[]")) }.getOrNull() ?: return emptyList()
         return List(arr.length()) { arr.optString(it) }.filter { it.isNotBlank() }
     }
-
     fun addRecentSearch(q: String) {
         val cur = (listOf(q) + getRecentSearches().filter { it != q }).take(10)
         sp.edit().putString("rec_q", JSONArray(cur).toString()).apply()
+    }
+
+    fun exportBackupJson(): String = JSONObject()
+        .put("addons", JSONArray(getAddonBases()))
+        .put("js_plugins", JSONArray(sp.getString("js_plugins", "[]")))
+        .put("favs", JSONArray(sp.getString("favs", "[]")))
+        .put("hist", JSONArray(sp.getString("hist", "[]")))
+        .toString()
+
+    fun importBackupJson(raw: String) {
+        val j = JSONObject(raw)
+        j.optJSONArray("addons")?.let { sp.edit().putString("addons", it.toString()).apply() }
+        j.optJSONArray("js_plugins")?.let { sp.edit().putString("js_plugins", it.toString()).apply() }
+        j.optJSONArray("favs")?.let { sp.edit().putString("favs", it.toString()).apply() }
+        j.optJSONArray("hist")?.let { sp.edit().putString("hist", it.toString()).apply() }
     }
 }
