@@ -7,7 +7,7 @@
     <application
         android:allowBackup="true"
         android:label="Streamer"
-        android:theme="@android:style/Theme.Material.NoTitleBar"
+        android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="true">
 
         <activity
