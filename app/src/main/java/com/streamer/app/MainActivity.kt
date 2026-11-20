@@ -4,6 +4,8 @@ package com.streamer.app
 
 import android.app.Activity
 import android.app.PictureInPictureParams
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
@@ -25,6 +27,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -39,6 +42,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.List
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -48,6 +52,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
@@ -82,6 +87,8 @@ import kotlin.math.abs
 
 private val BgDark = Color(0xFF0A0A0F)
 private val CardDark = Color(0xFF1A1A26)
+private val TextWhite = Color(0xFFF4F2F8)
+private val TextMut = Color(0xFF9490A8)
 private val AccentPink = Color(0xFFFF3D7F)
 private val AccentPurple = Color(0xFF7B5CFF)
 
@@ -97,6 +104,22 @@ private fun fmtMs(ms: Long): String {
     val m = s / 60
     val r = s % 60
     return if (m >= 60) "%d:%02d:%02d".format(m / 60, m % 60, r) else "%d:%02d".format(m, r)
+}
+
+private fun extractStreamBadges(s: StreamItem): List<Pair<String, Color>> {
+    val txt = "${s.title} ${s.filename ?: ""}"
+    val out = mutableListOf<Pair<String, Color>>()
+    Regex("\\b(2160p|4K|1080p|720p|480p)\\b", RegexOption.IGNORE_CASE).find(txt)?.let {
+        out += it.value.uppercase() to AccentPurple
+    }
+    Regex("\\b(\\d+(?:\\.\\d+)?\\s*(?:GB|MB))\\b", RegexOption.IGNORE_CASE).find(txt)?.let {
+        out += it.value.uppercase() to Color(0xFF0EA5E9)
+    }
+    Regex("\\b(HDR10\\+?|DV|Dolby\\s*Vision|HEVC|x265|10bit|IMAX)\\b", RegexOption.IGNORE_CASE)
+        .findAll(txt).map { it.value.uppercase() }.distinct().take(2).forEach {
+            out += it to Color(0xFF34D399)
+        }
+    return out
 }
 
 data class PlaySession(
@@ -122,11 +145,13 @@ class MainActivity : ComponentActivity() {
                     background = BgDark,
                     surface = CardDark,
                     onPrimary = Color(0xFF19040C),
-                    onBackground = Color(0xFFF4F2F8),
-                    onSurface = Color(0xFFF4F2F8)
+                    onBackground = TextWhite,
+                    onSurface = TextWhite
                 )
             ) {
-                StreamerApp(store)
+                Surface(Modifier.fillMaxSize(), color = BgDark, contentColor = TextWhite) {
+                    StreamerApp(store)
+                }
             }
         }
     }
@@ -206,6 +231,7 @@ fun StreamerApp(store: Store) {
 
     Scaffold(
         containerColor = BgDark,
+        contentColor = TextWhite,
         topBar = {
             Row(
                 Modifier
@@ -224,29 +250,14 @@ fun StreamerApp(store: Store) {
                     Icon(Icons.Rounded.PlayArrow, null, tint = Color.White, modifier = Modifier.size(18.dp))
                 }
                 Spacer(Modifier.width(10.dp))
-                Text("Streamer", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Streamer", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = TextWhite)
             }
         },
         bottomBar = {
             NavigationBar(containerColor = Color(0xFF0E0E16)) {
-                NavigationBarItem(
-                    selected = tab == "home",
-                    onClick = { tab = "home" },
-                    icon = { Icon(Icons.Rounded.Home, null) },
-                    label = { Text("Home") }
-                )
-                NavigationBarItem(
-                    selected = tab == "search",
-                    onClick = { tab = "search" },
-                    icon = { Icon(Icons.Rounded.Search, null) },
-                    label = { Text("Search") }
-                )
-                NavigationBarItem(
-                    selected = tab == "addons",
-                    onClick = { tab = "addons" },
-                    icon = { Icon(Icons.Rounded.Extension, null) },
-                    label = { Text("Addons") }
-                )
+                NavigationBarItem(selected = tab == "home", onClick = { tab = "home" }, icon = { Icon(Icons.Rounded.Home, null) }, label = { Text("Home") })
+                NavigationBarItem(selected = tab == "search", onClick = { tab = "search" }, icon = { Icon(Icons.Rounded.Search, null) }, label = { Text("Search") })
+                NavigationBarItem(selected = tab == "addons", onClick = { tab = "addons" }, icon = { Icon(Icons.Rounded.Extension, null) }, label = { Text("Addons") })
             }
         }
     ) { pad ->
@@ -258,7 +269,7 @@ fun StreamerApp(store: Store) {
                     addons = addons,
                     onAdd = { raw ->
                         if (raw.startsWith("cloudstreamrepo:", true) || raw.endsWith("/repo.json", true)) {
-                            return@AddonsScreen "CloudStream (.cs3) repo detected! Native JS/Scraper support is coming in Step 2 — for now, paste a Stremio manifest.json link."
+                            return@AddonsScreen "CloudStream (.cs3) repo detected! JS Scraper Engine is coming in Step 2 — for now, paste a Stremio manifest.json link."
                         }
                         val base = Engine.toBase(raw)
                         if (addons.any { it.base == base }) return@AddonsScreen "Addon already installed."
@@ -322,13 +333,23 @@ fun HomeScreen(
     }
 
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
-        featured?.let { f ->
-            item {
+        item(key = "featured_hero") {
+            val f = featured
+            if (f == null) {
                 Box(
                     Modifier
                         .padding(horizontal = 14.dp, vertical = 8.dp)
                         .fillMaxWidth()
-                        .height(240.dp)
+                        .height(220.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(CardDark)
+                )
+            } else {
+                Box(
+                    Modifier
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                        .fillMaxWidth()
+                        .height(230.dp)
                         .clip(RoundedCornerShape(18.dp))
                         .background(CardDark)
                         .clickable { onOpen(f) }
@@ -345,8 +366,8 @@ fun HomeScreen(
                         )
                     )
                     Column(Modifier.align(Alignment.BottomStart).padding(16.dp)) {
-                        Text(f.type.uppercase(), color = AccentPink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        Text(f.name, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("FEATURED ${f.type.uppercase()}", color = AccentPink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(f.name, color = TextWhite, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         f.description?.let {
                             Text(it, fontSize = 12.sp, color = Color(0xFFD0CDE0), maxLines = 2, overflow = TextOverflow.Ellipsis)
                         }
@@ -392,7 +413,7 @@ fun HomeScreen(
         if (catalogs.isEmpty()) {
             item {
                 Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Loading catalogs… or add an addon in Addons.", color = Color(0xFF9490A8))
+                    Text("Loading catalogs… or add an addon in Addons.", color = TextMut)
                     Spacer(Modifier.height(10.dp))
                     Button(onClick = onGoAddons) { Text("Open Addons") }
                 }
@@ -402,7 +423,7 @@ fun HomeScreen(
                 val list = rows["${a.base}_${c.type}_${c.id}"].orEmpty()
                 SectionTitle(c.name, c.type)
                 if (list.isEmpty()) {
-                    Text("Loading…", color = Color(0xFF9490A8), fontSize = 13.sp, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
+                    Text("Loading…", color = TextMut, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp))
                 } else {
                     LazyRow(contentPadding = PaddingValues(horizontal = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         items(list, key = { "${it.type}_${it.id}" }) { m ->
@@ -422,8 +443,8 @@ fun SectionTitle(title: String, tag: String) {
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-        Text(tag.uppercase(), fontSize = 11.sp, color = Color(0xFF9490A8))
+        Text(title, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = TextWhite)
+        Text(tag.uppercase(), fontSize = 11.sp, color = TextMut)
     }
 }
 
@@ -438,13 +459,7 @@ fun PosterCard(name: String, poster: String?, sub: String? = null, progress: Flo
                 .background(CardDark)
                 .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(12.dp))
         ) {
-            Text(
-                name,
-                fontSize = 11.sp,
-                color = Color(0xFF9490A8),
-                textAlign = TextAlign.Center,
-                modifier = Modifier.align(Alignment.Center).padding(8.dp)
-            )
+            Text(name, fontSize = 11.sp, color = TextMut, textAlign = TextAlign.Center, modifier = Modifier.align(Alignment.Center).padding(8.dp))
             AsyncImage(model = poster, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
             if (progress > 0f) {
                 Box(Modifier.align(Alignment.BottomStart).fillMaxWidth().height(4.dp).background(Color.White.copy(alpha = 0.2f))) {
@@ -453,9 +468,9 @@ fun PosterCard(name: String, poster: String?, sub: String? = null, progress: Flo
             }
         }
         Spacer(Modifier.height(5.dp))
-        Text(name, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(name, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = TextWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
         if (!sub.isNullOrBlank()) {
-            Text(sub, fontSize = 11.sp, color = Color(0xFF9490A8), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(sub, fontSize = 11.sp, color = TextMut, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -519,7 +534,7 @@ fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) 
         }
 
         if (results.isEmpty() && !searching && recents.isNotEmpty()) {
-            Text("Recent Searches", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp, bottom = 6.dp))
+            Text("Recent Searches", fontWeight = FontWeight.Bold, color = TextWhite, modifier = Modifier.padding(top = 8.dp, bottom = 6.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(recents) { rq ->
                     AssistChip(onClick = { query = rq; runSearch(rq) }, label = { Text(rq) })
@@ -535,9 +550,7 @@ fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) 
             }
         }
 
-        if (searching) {
-            LinearProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 8.dp))
-        }
+        if (searching) LinearProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 8.dp))
 
         val filtered = if (filter == "all") results else results.filter { it.type == filter }
         LazyVerticalGrid(
@@ -572,6 +585,7 @@ fun DetailScreen(
     var selectedSeason by remember { mutableIntStateOf(1) }
     var loadingStreams by remember { mutableStateOf(false) }
     var streamList by remember { mutableStateOf<List<StreamItem>?>(null) }
+    var streamFilter by remember { mutableStateOf("ALL") }
     var activeVid by remember { mutableStateOf(initial.id) }
     var activeEpLabel by remember { mutableStateOf("") }
 
@@ -592,6 +606,7 @@ fun DetailScreen(
         activeEpLabel = epLab
         loadingStreams = true
         streamList = null
+        streamFilter = "ALL"
         scope.launch {
             streamList = Engine.fetchStreams(addons, meta.type, vid)
             loadingStreams = false
@@ -607,14 +622,10 @@ fun DetailScreen(
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.matchParentSize().blur(18.dp)
                 )
-                Box(
-                    Modifier.matchParentSize().background(
-                        Brush.verticalGradient(listOf(Color(0x880A0A0F), BgDark))
-                    )
-                )
+                Box(Modifier.matchParentSize().background(Brush.verticalGradient(listOf(Color(0x660A0A0F), BgDark))))
                 Column(Modifier.statusBarsPadding().padding(14.dp)) {
-                    IconButton(onClick = onBack, modifier = Modifier.background(Color.Black.copy(0.45f), CircleShape)) {
-                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back")
+                    IconButton(onClick = onBack, modifier = Modifier.background(Color.Black.copy(0.55f), CircleShape)) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back", tint = Color.White)
                     }
                     Spacer(Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -625,15 +636,11 @@ fun DetailScreen(
                             modifier = Modifier.width(114.dp).aspectRatio(2f / 3f).clip(RoundedCornerShape(12.dp)).background(CardDark)
                         )
                         Column(Modifier.weight(1f)) {
-                            Text(meta.name, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                            val info = listOfNotNull(
-                                meta.imdbRating?.let { "★ $it" },
-                                meta.releaseInfo,
-                                meta.runtime
-                            ).joinToString(" · ")
+                            Text(meta.name, fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextWhite)
+                            val info = listOfNotNull(meta.imdbRating?.let { "★ $it" }, meta.releaseInfo, meta.runtime).joinToString(" · ")
                             if (info.isNotBlank()) Text(info, color = Color(0xFFFBBF24), fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
                             if (meta.genres.isNotEmpty()) {
-                                Text(meta.genres.take(3).joinToString(", "), color = Color(0xFF9490A8), fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+                                Text(meta.genres.take(3).joinToString(", "), color = Color(0xFFD0CDE0), fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
                             }
                             Spacer(Modifier.height(10.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -649,14 +656,14 @@ fun DetailScreen(
                                 }
                                 IconButton(
                                     onClick = { onToggleFav(meta) },
-                                    modifier = Modifier.background(Color.White.copy(0.1f), CircleShape)
+                                    modifier = Modifier.background(Color.White.copy(0.14f), CircleShape)
                                 ) {
                                     Icon(if (isFav) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder, null, tint = if (isFav) AccentPink else Color.White)
                                 }
                             }
                             if (contItem != null) {
                                 TextButton(onClick = { onClearHist(meta.id) }, contentPadding = PaddingValues(0.dp)) {
-                                    Text("Clear progress", fontSize = 12.sp, color = Color(0xFF9490A8))
+                                    Text("Clear progress", fontSize = 12.sp, color = TextMut)
                                 }
                             }
                         }
@@ -674,7 +681,7 @@ fun DetailScreen(
                 Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                     Spacer(Modifier.width(12.dp))
-                    Text("Fetching streams $activeEpLabel…")
+                    Text("Fetching streams $activeEpLabel…", color = TextWhite)
                 }
             }
         }
@@ -682,24 +689,60 @@ fun DetailScreen(
         streamList?.let { list ->
             val playable = list.filter { it.url != null }
             item { SectionTitle("Streams $activeEpLabel", "${list.size} found") }
-            if (list.isEmpty()) {
+            if (list.size > 3) {
+                item {
+                    LazyRow(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(listOf("ALL", "4K", "1080P", "720P")) { tag ->
+                            FilterChip(
+                                selected = streamFilter == tag,
+                                onClick = { streamFilter = tag },
+                                label = { Text(tag) }
+                            )
+                        }
+                    }
+                }
+            }
+            val shown = when (streamFilter) {
+                "4K" -> list.filter { it.title.contains("2160p", true) || it.title.contains("4k", true) }
+                "1080P" -> list.filter { it.title.contains("1080p", true) }
+                "720P" -> list.filter { it.title.contains("720p", true) }
+                else -> list
+            }
+            if (shown.isEmpty()) {
                 item {
                     Text(
-                        "No streams returned by your addons. Make sure you added a Stremio stream addon in the Addons tab.",
-                        color = Color(0xFF9490A8),
-                        modifier = Modifier.padding(horizontal = 14.dp)
+                        "No streams match $streamFilter.",
+                        color = TextMut,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
                     )
                 }
             } else {
-                items(list) { s ->
+                items(shown) { s ->
+                    val badges = remember(s) { extractStreamBadges(s) }
                     Card(
                         colors = CardDefaults.cardColors(containerColor = CardDark),
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp)
                     ) {
                         Column(Modifier.padding(12.dp)) {
-                            Text(s.addonName.uppercase(), color = AccentPink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            Spacer(Modifier.height(4.dp))
-                            Text(s.title, fontSize = 13.sp)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text(s.addonName.uppercase(), color = AccentPink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                    badges.forEach { (bTxt, bCol) ->
+                                        Text(
+                                            bTxt,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = bCol,
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(5.dp))
+                                                .background(bCol.copy(alpha = 0.18f))
+                                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(5.dp))
+                            Text(s.title, fontSize = 13.sp, color = TextWhite)
                             Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 if (s.url != null) {
@@ -709,15 +752,20 @@ fun DetailScreen(
                                             onPlay(PlaySession(s, title, meta, activeVid, activeEpLabel, playable, meta.videos))
                                         },
                                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
-                                    ) { Text("▶ Play (ExoPlayer)") }
+                                    ) { Text("▶ Play") }
                                     OutlinedButton(onClick = {
-                                        val i = Intent(Intent.ACTION_VIEW, Uri.parse(s.url)).setDataAndType(Uri.parse(s.url), "video/*")
+                                        val i = Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(s.url), "video/*")
                                         runCatching { ctx.startActivity(i) }
-                                    }) { Text("External") }
+                                    }) { Text("External", color = TextWhite) }
+                                    OutlinedButton(onClick = {
+                                        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        cm.setPrimaryClip(ClipData.newPlainText("url", s.url))
+                                        Toast.makeText(ctx, "Link copied", Toast.LENGTH_SHORT).show()
+                                    }) { Text("Copy", color = TextWhite) }
                                 } else if (s.externalUrl != null) {
                                     OutlinedButton(onClick = {
                                         runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(s.externalUrl))) }
-                                    }) { Text("Open Link") }
+                                    }) { Text("Open Link", color = TextWhite) }
                                 } else {
                                     Text("Torrent/P2P stream (Needs Debrid addon)", fontSize = 12.sp, color = Color(0xFFFBBF24))
                                 }
@@ -756,7 +804,7 @@ fun DetailScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Box(Modifier.width(104.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(8.dp)).background(BgDark), contentAlignment = Alignment.Center) {
-                        Text("E${ep.episode}", fontSize = 12.sp, color = Color(0xFF9490A8))
+                        Text("E${ep.episode}", fontSize = 12.sp, color = TextMut)
                         AsyncImage(model = ep.thumbnail, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                     }
                     Spacer(Modifier.width(12.dp))
@@ -766,10 +814,10 @@ fun DetailScreen(
                                 Icon(Icons.Rounded.Check, null, tint = Color(0xFF34D399), modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(4.dp))
                             }
-                            Text("${ep.episode}. ${ep.title}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("${ep.episode}. ${ep.title}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         ep.overview?.let {
-                            Text(it, fontSize = 12.sp, color = Color(0xFF9490A8), maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(it, fontSize = 12.sp, color = TextMut, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
@@ -793,8 +841,8 @@ fun AddonsScreen(
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
             Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("Addons & Extensions", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                IconButton(onClick = onRefresh) { Icon(Icons.Rounded.Refresh, "Refresh") }
+                Text("Addons & Extensions", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = TextWhite)
+                IconButton(onClick = onRefresh) { Icon(Icons.Rounded.Refresh, "Refresh", tint = TextWhite) }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
@@ -817,9 +865,7 @@ fun AddonsScreen(
                     }
                 }) { Icon(Icons.Rounded.Add, null); Text("Add") }
             }
-            if (status.isNotBlank()) {
-                Text(status, fontSize = 13.sp, color = AccentPink, modifier = Modifier.padding(top = 6.dp))
-            }
+            if (status.isNotBlank()) Text(status, fontSize = 13.sp, color = AccentPink, modifier = Modifier.padding(top = 6.dp))
             Spacer(Modifier.height(10.dp))
         }
         items(addons.size) { i ->
@@ -827,12 +873,12 @@ fun AddonsScreen(
             Card(colors = CardDefaults.cardColors(containerColor = CardDark), modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text(a.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(if (a.loaded) "${a.catalogs.size} catalogs" else a.base, fontSize = 12.sp, color = Color(0xFF9490A8), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(a.name, fontWeight = FontWeight.Bold, color = TextWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(if (a.loaded) "${a.catalogs.size} catalogs" else a.base, fontSize = 12.sp, color = TextMut, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
-                    if (i > 0) IconButton(onClick = { onMove(i, i - 1) }) { Text("↑") }
-                    if (i < addons.lastIndex) IconButton(onClick = { onMove(i, i + 1) }) { Text("↓") }
-                    IconButton(onClick = { onRemove(i) }) { Icon(Icons.Rounded.Delete, "Remove") }
+                    if (i > 0) IconButton(onClick = { onMove(i, i - 1) }) { Text("↑", color = TextWhite) }
+                    if (i < addons.lastIndex) IconButton(onClick = { onMove(i, i + 1) }) { Text("↓", color = TextWhite) }
+                    IconButton(onClick = { onRemove(i) }) { Icon(Icons.Rounded.Delete, "Remove", tint = TextWhite) }
                 }
             }
         }
@@ -865,9 +911,8 @@ fun PlayerScreen(
     var hudText by remember { mutableStateOf<String?>(null) }
     var errMsg by remember { mutableStateOf<String?>(null) }
     var tracks by remember { mutableStateOf(Tracks.EMPTY) }
-    var sheetMode by remember { mutableStateOf<String?>(null) } // audio, quality, subs, sources, episodes
+    var sheetMode by remember { mutableStateOf<String?>(null) }
 
-    // External Subtitles
     var extSubs by remember { mutableStateOf<List<SubItem>>(emptyList()) }
     var activeCues by remember { mutableStateOf<List<SubCue>>(emptyList()) }
     var activeExtLabel by remember { mutableStateOf("None") }
@@ -906,7 +951,6 @@ fun PlayerScreen(
         extSubs = Engine.fetchSubtitles(addons, session.meta.type, session.vid)
     }
 
-    // Immersive Landscape & Cleanup
     DisposableEffect(exoPlayer) {
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         val w = activity?.window
@@ -934,7 +978,6 @@ fun PlayerScreen(
         }
     }
 
-    // Progress & Auto-hide
     LaunchedEffect(exoPlayer) {
         var lastSave = 0L
         while (true) {
@@ -977,433 +1020,395 @@ fun PlayerScreen(
             if (pick != null) {
                 val lab = "S${ep.season}E${ep.episode}"
                 onSwitchSession(PlaySession(pick, "${session.meta.name} $lab", session.meta, ep.id, lab, ss, session.episodes))
-            } else {
-                hudText = "No stream found"
-            }
+            } else hudText = "No stream found"
         }
     }
 
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-            .onSizeChanged { playerSize = it }
-    ) {
-        AndroidView(
-            factory = { c ->
-                PlayerView(c).apply {
-                    useController = false
-                    keepScreenOn = true
-                    player = exoPlayer
-                    this.resizeMode = resizeMode
-                }
-            },
-            update = { v ->
-                v.player = exoPlayer
-                v.resizeMode = resizeMode
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+    Surface(Modifier.fillMaxSize(), color = Color.Black, contentColor = Color.White) {
+        Box(Modifier.fillMaxSize().onSizeChanged { playerSize = it }) {
+            AndroidView(
+                factory = { c ->
+                    PlayerView(c).apply {
+                        useController = false
+                        keepScreenOn = true
+                        player = exoPlayer
+                        this.resizeMode = resizeMode
+                    }
+                },
+                update = { v ->
+                    v.player = exoPlayer
+                    v.resizeMode = resizeMode
+                },
+                modifier = Modifier.fillMaxSize()
+            )
 
-        // Gesture Surface (Tap, Double-tap, Brightness/Volume/Seek Swipe)
-        var dragMode by remember { mutableStateOf<String?>(null) }
-        var dragStartX by remember { mutableFloatStateOf(0f) }
-        var dragAccumY by remember { mutableFloatStateOf(0f) }
-        var dragAccumX by remember { mutableFloatStateOf(0f) }
-        var startPos by remember { mutableLongStateOf(0L) }
-        var startBright by remember { mutableFloatStateOf(0.5f) }
-        var startVol by remember { mutableIntStateOf(5) }
+            var dragMode by remember { mutableStateOf<String?>(null) }
+            var dragStartX by remember { mutableFloatStateOf(0f) }
+            var dragAccumY by remember { mutableFloatStateOf(0f) }
+            var dragAccumX by remember { mutableFloatStateOf(0f) }
+            var startPos by remember { mutableLongStateOf(0L) }
+            var startBright by remember { mutableFloatStateOf(0.5f) }
+            var startVol by remember { mutableIntStateOf(5) }
 
-        Box(
-            Modifier
-                .fillMaxSize()
-                .pointerInput(locked) {
-                    detectTapGestures(
-                        onTap = { showControls = !showControls },
-                        onDoubleTap = { offset ->
-                            if (!locked) {
-                                val delta = if (offset.x < playerSize.width / 2f) -10_000L else 10_000L
-                                val target = (exoPlayer.currentPosition + delta).coerceIn(0L, durMs.coerceAtLeast(1L))
-                                exoPlayer.seekTo(target)
-                                hudText = if (delta < 0) "⏪ -10s" else "+10s ⏩"
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(locked) {
+                        detectTapGestures(
+                            onTap = {
+                                if (sheetMode != null) sheetMode = null else showControls = !showControls
+                            },
+                            onDoubleTap = { offset ->
+                                if (!locked) {
+                                    val delta = if (offset.x < playerSize.width / 2f) -10_000L else 10_000L
+                                    val target = (exoPlayer.currentPosition + delta).coerceIn(0L, durMs.coerceAtLeast(1L))
+                                    exoPlayer.seekTo(target)
+                                    hudText = if (delta < 0) "⏪ -10s" else "+10s ⏩"
+                                }
                             }
-                        }
+                        )
+                    }
+                    .pointerInput(locked) {
+                        if (locked) return@pointerInput
+                        detectDragGestures(
+                            onDragStart = { start ->
+                                dragMode = null
+                                dragStartX = start.x
+                                dragAccumX = 0f
+                                dragAccumY = 0f
+                                startPos = exoPlayer.currentPosition
+                                val curB = activity?.window?.attributes?.screenBrightness ?: -1f
+                                startBright = if (curB < 0f) 0.5f else curB
+                                startVol = audioMgr.getStreamVolume(AudioManager.STREAM_MUSIC)
+                            },
+                            onDrag = { change, amount ->
+                                change.consume()
+                                dragAccumX += amount.x
+                                dragAccumY += amount.y
+                                if (dragMode == null && (abs(dragAccumX) > 20f || abs(dragAccumY) > 20f)) {
+                                    dragMode = if (abs(dragAccumX) > abs(dragAccumY)) "seek"
+                                    else if (dragStartX < playerSize.width / 2f) "bright" else "vol"
+                                }
+                                when (dragMode) {
+                                    "seek" -> {
+                                        val deltaMs = (dragAccumX * 120f).toLong()
+                                        val target = (startPos + deltaMs).coerceIn(0L, durMs.coerceAtLeast(1L))
+                                        posMs = target
+                                        isSeeking = true
+                                        hudText = "${fmtMs(target)} (${if (deltaMs >= 0) "+" else ""}${deltaMs / 1000}s)"
+                                    }
+                                    "bright" -> {
+                                        val nb = (startBright - dragAccumY / 450f).coerceIn(0.05f, 1f)
+                                        activity?.window?.attributes = activity?.window?.attributes?.apply { screenBrightness = nb }
+                                        hudText = "☀ ${(nb * 100).toInt()}%"
+                                    }
+                                    "vol" -> {
+                                        val maxV = audioMgr.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                                        val nv = (startVol - (dragAccumY / 35f).toInt()).coerceIn(0, maxV)
+                                        audioMgr.setStreamVolume(AudioManager.STREAM_MUSIC, nv, 0)
+                                        hudText = "🔊 ${(nv * 100 / maxV)}%"
+                                    }
+                                }
+                            },
+                            onDragEnd = {
+                                if (dragMode == "seek") {
+                                    exoPlayer.seekTo(posMs)
+                                    isSeeking = false
+                                }
+                                dragMode = null
+                            },
+                            onDragCancel = { isSeeking = false; dragMode = null }
+                        )
+                    }
+            )
+
+            if (activeCues.isNotEmpty()) {
+                val t = posMs - subOffsetMs
+                val text = activeCues.filter { t in it.startMs..it.endMs }.joinToString("\n") { it.text }
+                if (text.isNotBlank()) {
+                    Text(
+                        text,
+                        color = Color.White,
+                        fontSize = subSizeSp.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(horizontal = 24.dp, vertical = if (showControls) 98.dp else 24.dp)
+                            .background(Color.Black.copy(alpha = 0.74f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
                     )
                 }
-                .pointerInput(locked) {
-                    if (locked) return@pointerInput
-                    detectDragGestures(
-                        onDragStart = { start ->
-                            dragMode = null
-                            dragStartX = start.x
-                            dragAccumX = 0f
-                            dragAccumY = 0f
-                            startPos = exoPlayer.currentPosition
-                            val curB = activity?.window?.attributes?.screenBrightness ?: -1f
-                            startBright = if (curB < 0f) 0.5f else curB
-                            startVol = audioMgr.getStreamVolume(AudioManager.STREAM_MUSIC)
-                        },
-                        onDrag = { change, amount ->
-                            change.consume()
-                            dragAccumX += amount.x
-                            dragAccumY += amount.y
-                            if (dragMode == null && (abs(dragAccumX) > 20f || abs(dragAccumY) > 20f)) {
-                                dragMode = if (abs(dragAccumX) > abs(dragAccumY)) "seek"
-                                else if (dragStartX < playerSize.width / 2f) "bright" else "vol"
-                            }
-                            when (dragMode) {
-                                "seek" -> {
-                                    val deltaMs = (dragAccumX * 120f).toLong()
-                                    val target = (startPos + deltaMs).coerceIn(0L, durMs.coerceAtLeast(1L))
-                                    posMs = target
-                                    isSeeking = true
-                                    hudText = "${fmtMs(target)} (${if (deltaMs >= 0) "+" else ""}${deltaMs / 1000}s)"
-                                }
-                                "bright" -> {
-                                    val nb = (startBright - dragAccumY / 450f).coerceIn(0.05f, 1f)
-                                    activity?.window?.attributes = activity?.window?.attributes?.apply { screenBrightness = nb }
-                                    hudText = "☀ ${(nb * 100).toInt()}%"
-                                }
-                                "vol" -> {
-                                    val maxV = audioMgr.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
-                                    val nv = (startVol - (dragAccumY / 35f).toInt()).coerceIn(0, maxV)
-                                    audioMgr.setStreamVolume(AudioManager.STREAM_MUSIC, nv, 0)
-                                    hudText = "🔊 ${(nv * 100 / maxV)}%"
-                                }
-                            }
-                        },
-                        onDragEnd = {
-                            if (dragMode == "seek") {
-                                exoPlayer.seekTo(posMs)
-                                isSeeking = false
-                            }
-                            dragMode = null
-                        },
-                        onDragCancel = { isSeeking = false; dragMode = null }
-                    )
-                }
-        )
-
-        // External Subtitle Overlay
-        if (activeCues.isNotEmpty()) {
-            val t = posMs - subOffsetMs
-            val text = activeCues.filter { t in it.startMs..it.endMs }.joinToString("\n") { it.text }
-            if (text.isNotBlank()) {
-                Text(
-                    text,
-                    color = Color.White,
-                    fontSize = subSizeSp.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(horizontal = 24.dp, vertical = if (showControls) 96.dp else 24.dp)
-                        .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(8.dp))
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
-                )
             }
-        }
 
-        // HUD Feedback
-        hudText?.let {
-            Surface(
-                color = Color.Black.copy(alpha = 0.78f),
-                shape = CircleShape,
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = 64.dp)
-            ) {
-                Text(it, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-            }
-        }
-
-        // Controls UI
-        if (showControls) {
-            if (locked) {
-                IconButton(
-                    onClick = { locked = false },
-                    modifier = Modifier.align(Alignment.TopStart).padding(16.dp).background(Color.Black.copy(0.6f), CircleShape)
-                ) { Icon(Icons.Rounded.LockOpen, "Unlock") }
-            } else {
-                Column(
-                    Modifier
-                        .fillMaxSize()
-                        .background(Brush.verticalGradient(listOf(Color(0xBB000000), Color.Transparent, Color(0xCC000000))))
-                        .padding(14.dp),
-                    verticalArrangement = Arrangement.SpaceBetween
+            hudText?.let {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.8f),
+                    contentColor = Color.White,
+                    shape = CircleShape,
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 64.dp)
                 ) {
-                    // Top Bar
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Close") }
-                        Text(session.title, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            IconButton(onClick = {
-                                activity?.enterPictureInPictureMode(
-                                    PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()
-                                )
-                            }) { Icon(Icons.Rounded.PictureInPictureAlt, "PiP") }
-                        }
-                        IconButton(onClick = { locked = true }) { Icon(Icons.Rounded.Lock, "Lock") }
-                    }
+                    Text(it, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                }
+            }
 
-                    // Center Controls
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(
-                            onClick = { exoPlayer.seekTo((exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)) },
-                            modifier = Modifier.size(54.dp).background(Color.Black.copy(0.45f), CircleShape)
-                        ) { Icon(Icons.Rounded.Replay10, "-10s", modifier = Modifier.size(30.dp)) }
-
-                        Spacer(Modifier.width(28.dp))
-
-                        IconButton(
-                            onClick = { if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play() },
-                            modifier = Modifier.size(68.dp).background(AccentPink, CircleShape)
-                        ) {
-                            Icon(
-                                if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                "Play/Pause",
-                                tint = Color(0xFF19040C),
-                                modifier = Modifier.size(38.dp)
-                            )
-                        }
-
-                        Spacer(Modifier.width(28.dp))
-
-                        IconButton(
-                            onClick = { exoPlayer.seekTo(exoPlayer.currentPosition + 10_000L) },
-                            modifier = Modifier.size(54.dp).background(Color.Black.copy(0.45f), CircleShape)
-                        ) { Icon(Icons.Rounded.Forward10, "+10s", modifier = Modifier.size(30.dp)) }
-                    }
-
-                    // Bottom Bar
-                    Column {
+            if (showControls) {
+                if (locked) {
+                    IconButton(
+                        onClick = { locked = false },
+                        modifier = Modifier.align(Alignment.TopStart).padding(16.dp).background(Color.Black.copy(0.65f), CircleShape)
+                    ) { Icon(Icons.Rounded.LockOpen, "Unlock", tint = Color.White) }
+                } else {
+                    Column(
+                        Modifier
+                            .fillMaxSize()
+                            .background(Brush.verticalGradient(listOf(Color(0xCC000000), Color.Transparent, Color(0xD8000000))))
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.SpaceBetween
+                    ) {
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(fmtMs(posMs), fontSize = 12.sp)
-                            Slider(
-                                value = if (durMs > 0) posMs.toFloat() / durMs else 0f,
-                                onValueChange = { isSeeking = true; posMs = (it * durMs).toLong() },
-                                onValueChangeFinished = { exoPlayer.seekTo(posMs); isSeeking = false },
-                                modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
-                            )
-                            Text(fmtMs(durMs), fontSize = 12.sp)
+                            IconButton(onClick = onClose) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Close", tint = Color.White) }
+                            Text(session.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                IconButton(onClick = {
+                                    activity?.enterPictureInPictureMode(
+                                        PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()
+                                    )
+                                }) { Icon(Icons.Rounded.PictureInPictureAlt, "PiP", tint = Color.White) }
+                            }
+                            IconButton(onClick = { locked = true }) { Icon(Icons.Rounded.Lock, "Lock", tint = Color.White) }
                         }
-                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            item {
-                                TextButton(onClick = { exoPlayer.seekTo(exoPlayer.currentPosition + 85_000L); hudText = "+85s" }) {
-                                    Text("+85s")
-                                }
+
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = { exoPlayer.seekTo((exoPlayer.currentPosition - 10_000L).coerceAtLeast(0L)) },
+                                modifier = Modifier.size(52.dp).background(Color.Black.copy(0.55f), CircleShape)
+                            ) { Icon(Icons.Rounded.Replay10, "-10s", tint = Color.White, modifier = Modifier.size(28.dp)) }
+
+                            Spacer(Modifier.width(28.dp))
+
+                            IconButton(
+                                onClick = { if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play() },
+                                modifier = Modifier.size(66.dp).background(AccentPink, CircleShape)
+                            ) {
+                                Icon(
+                                    if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                                    "Play/Pause",
+                                    tint = Color(0xFF19040C),
+                                    modifier = Modifier.size(36.dp)
+                                )
                             }
-                            item {
-                                TextButton(onClick = { sheetMode = "audio" }) {
-                                    Icon(Icons.Rounded.Audiotrack, null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(4.dp)); Text("Audio")
-                                }
+
+                            Spacer(Modifier.width(28.dp))
+
+                            IconButton(
+                                onClick = { exoPlayer.seekTo(exoPlayer.currentPosition + 10_000L) },
+                                modifier = Modifier.size(52.dp).background(Color.Black.copy(0.55f), CircleShape)
+                            ) { Icon(Icons.Rounded.Forward10, "+10s", tint = Color.White, modifier = Modifier.size(28.dp)) }
+                        }
+
+                        Column {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Text(fmtMs(posMs), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                PlayerSeekBar(
+                                    posMs = posMs,
+                                    durMs = durMs,
+                                    onSeekPreview = { isSeeking = true; posMs = it },
+                                    onSeekCommit = { exoPlayer.seekTo(it); posMs = it; isSeeking = false },
+                                    modifier = Modifier.weight(1f).padding(horizontal = 12.dp)
+                                )
+                                Text(fmtMs(durMs), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                             }
-                            item {
-                                TextButton(onClick = { sheetMode = "quality" }) {
-                                    Icon(Icons.Rounded.HighQuality, null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(4.dp)); Text("Quality")
+                            Spacer(Modifier.height(4.dp))
+                            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                item { PlayerPill("+85s", null) { exoPlayer.seekTo(exoPlayer.currentPosition + 85_000L); hudText = "+85s" } }
+                                item { PlayerPill("Audio", Icons.Rounded.Audiotrack) { sheetMode = "audio" } }
+                                item { PlayerPill("Quality", Icons.Rounded.HighQuality) { sheetMode = "quality" } }
+                                item { PlayerPill("Subs", Icons.Rounded.Subtitles) { sheetMode = "subs" } }
+                                if (session.allStreams.size > 1) {
+                                    item { PlayerPill("Sources (${session.allStreams.size})", null) { sheetMode = "sources" } }
                                 }
-                            }
-                            item {
-                                TextButton(onClick = { sheetMode = "subs" }) {
-                                    Icon(Icons.Rounded.Subtitles, null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(4.dp)); Text("Subs")
-                                }
-                            }
-                            if (session.allStreams.size > 1) {
-                                item {
-                                    TextButton(onClick = { sheetMode = "sources" }) { Text("Sources (${session.allStreams.size})") }
-                                }
-                            }
-                            if (session.episodes.isNotEmpty()) {
-                                item {
+                                if (session.episodes.isNotEmpty()) {
                                     val idx = session.episodes.indexOfFirst { it.id == session.vid }
                                     val nx = if (idx in 0 until session.episodes.lastIndex) session.episodes[idx + 1] else null
                                     if (nx != null) {
-                                        TextButton(onClick = { loadEpisode(nx) }) {
-                                            Icon(Icons.Rounded.SkipNext, null, modifier = Modifier.size(16.dp)); Text("Next")
-                                        }
+                                        item { PlayerPill("Next", Icons.Rounded.SkipNext) { loadEpisode(nx) } }
+                                    }
+                                    item { PlayerPill("Episodes", Icons.AutoMirrored.Rounded.List) { sheetMode = "episodes" } }
+                                }
+                                item {
+                                    PlayerPill("${speed}x", Icons.Rounded.Speed) {
+                                        val sp = listOf(1f, 1.25f, 1.5f, 2f, 0.75f)
+                                        speed = sp[(sp.indexOf(speed) + 1) % sp.size]
+                                        exoPlayer.setPlaybackSpeed(speed)
+                                        hudText = "${speed}x"
                                     }
                                 }
                                 item {
-                                    TextButton(onClick = { sheetMode = "episodes" }) {
-                                        Icon(Icons.Rounded.List, null, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(4.dp)); Text("Episodes")
+                                    PlayerPill("Fit", Icons.Rounded.AspectRatio) {
+                                        val modes = listOf(
+                                            AspectRatioFrameLayout.RESIZE_MODE_FIT to "Fit",
+                                            AspectRatioFrameLayout.RESIZE_MODE_ZOOM to "Zoom",
+                                            AspectRatioFrameLayout.RESIZE_MODE_FILL to "Stretch"
+                                        )
+                                        val nxt = modes[(modes.indexOfFirst { it.first == resizeMode } + 1) % modes.size]
+                                        resizeMode = nxt.first
+                                        hudText = nxt.second
                                     }
                                 }
-                            }
-                            item {
-                                TextButton(onClick = {
-                                    val sp = listOf(1f, 1.25f, 1.5f, 2f, 0.75f)
-                                    speed = sp[(sp.indexOf(speed) + 1) % sp.size]
-                                    exoPlayer.setPlaybackSpeed(speed)
-                                    hudText = "${speed}x"
-                                }) {
-                                    Icon(Icons.Rounded.Speed, null, modifier = Modifier.size(16.dp))
-                                    Spacer(Modifier.width(4.dp)); Text("${speed}x")
-                                }
-                            }
-                            item {
-                                TextButton(onClick = {
-                                    val modes = listOf(
-                                        AspectRatioFrameLayout.RESIZE_MODE_FIT to "Fit",
-                                        AspectRatioFrameLayout.RESIZE_MODE_ZOOM to "Zoom",
-                                        AspectRatioFrameLayout.RESIZE_MODE_FILL to "Stretch"
-                                    )
-                                    val nxt = modes[(modes.indexOfFirst { it.first == resizeMode } + 1) % modes.size]
-                                    resizeMode = nxt.first
-                                    hudText = nxt.second
-                                }) { Icon(Icons.Rounded.AspectRatio, null, modifier = Modifier.size(16.dp)) }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Error Overlay
-        errMsg?.let { em ->
-            Column(
-                Modifier.fillMaxSize().background(Color.Black.copy(0.88f)).padding(24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
-            ) {
-                Icon(Icons.Rounded.Warning, null, tint = AccentPink, modifier = Modifier.size(40.dp))
-                Spacer(Modifier.height(10.dp))
-                Text("Stream Failed: $em", textAlign = TextAlign.Center)
-                Spacer(Modifier.height(14.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    if (session.allStreams.size > 1) {
-                        Button(onClick = { errMsg = null; sheetMode = "sources" }) { Text("Switch Source") }
+            errMsg?.let { em ->
+                Column(
+                    Modifier.fillMaxSize().background(Color.Black.copy(0.88f)).padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Icon(Icons.Rounded.Warning, null, tint = AccentPink, modifier = Modifier.size(40.dp))
+                    Spacer(Modifier.height(10.dp))
+                    Text("Stream Failed: $em", color = Color.White, textAlign = TextAlign.Center)
+                    Spacer(Modifier.height(14.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        if (session.allStreams.size > 1) Button(onClick = { errMsg = null; sheetMode = "sources" }) { Text("Switch Source") }
+                        OutlinedButton(onClick = {
+                            val i = Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(session.stream.url), "video/*")
+                            runCatching { ctx.startActivity(i) }
+                        }) { Text("Open in VLC", color = Color.White) }
+                        OutlinedButton(onClick = onClose) { Text("Back", color = Color.White) }
                     }
-                    OutlinedButton(onClick = onClose) { Text("Back") }
                 }
             }
-        }
 
-        // In-Player Side/Bottom Panel (Audio, Quality, Subtitles, Sources, Episodes)
-        sheetMode?.let { mode ->
-            Surface(
-                color = Color(0xF2141420),
-                shape = RoundedCornerShape(16.dp),
-                modifier = Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(16.dp)
-                    .widthIn(max = 360.dp)
-                    .fillMaxHeight(0.86f)
-            ) {
-                Column(Modifier.padding(14.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Text(mode.uppercase(), fontWeight = FontWeight.Bold, color = AccentPink)
-                        IconButton(onClick = { sheetMode = null }) { Icon(Icons.Rounded.Close, "Close") }
-                    }
-                    HorizontalDivider(color = Color.White.copy(0.1f))
-                    Spacer(Modifier.height(8.dp))
+            sheetMode?.let { mode ->
+                Surface(
+                    color = Color(0xF5141420),
+                    contentColor = Color.White,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(14.dp)
+                        .widthIn(max = 380.dp)
+                        .fillMaxHeight(0.88f)
+                ) {
+                    Column(Modifier.padding(14.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text(mode.uppercase(), fontWeight = FontWeight.Bold, color = AccentPink)
+                            IconButton(onClick = { sheetMode = null }) { Icon(Icons.Rounded.Close, "Close", tint = Color.White) }
+                        }
+                        HorizontalDivider(color = Color.White.copy(0.14f))
+                        Spacer(Modifier.height(8.dp))
 
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        when (mode) {
-                            "audio" -> {
-                                val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
-                                if (audioGroups.isEmpty()) {
-                                    item { Text("Only 1 audio track detected in this stream.", color = Color(0xFF9490A8)) }
-                                } else {
-                                    audioGroups.forEach { g ->
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            when (mode) {
+                                "audio" -> {
+                                    val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+                                    if (audioGroups.isEmpty()) {
+                                        item { Text("No switchable audio tracks found.", color = TextMut) }
+                                    } else {
+                                        audioGroups.forEach { g ->
+                                            items(g.length) { i ->
+                                                val f = g.getTrackFormat(i)
+                                                val lbl = listOfNotNull(f.label, f.language?.uppercase(), f.codecs, "${f.channelCount}ch").joinToString(" · ")
+                                                OptionRow(lbl.ifBlank { "Audio Track ${i + 1}" }, g.isTrackSelected(i)) {
+                                                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+                                                        .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                                                        .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i))
+                                                        .build()
+                                                    sheetMode = null
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                "quality" -> {
+                                    item {
+                                        OptionRow("Auto (Best Available)", exoPlayer.trackSelectionParameters.overrides.isEmpty()) {
+                                            exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+                                                .clearOverridesOfType(C.TRACK_TYPE_VIDEO).build()
+                                            sheetMode = null
+                                        }
+                                    }
+                                    tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }.forEach { g ->
                                         items(g.length) { i ->
                                             val f = g.getTrackFormat(i)
-                                            val lbl = listOfNotNull(f.label, f.language?.uppercase(), f.codecs, "${f.channelCount}ch").joinToString(" · ")
-                                            val sel = g.isTrackSelected(i)
-                                            OptionRow(lbl.ifBlank { "Audio Track ${i + 1}" }, sel) {
+                                            val lbl = "${if (f.height > 0) "${f.height}p" else "Video $i"} ${if (f.bitrate > 0) "· ${f.bitrate / 1000} kbps" else ""}"
+                                            OptionRow(lbl, g.isTrackSelected(i)) {
                                                 exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
-                                                    .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
-                                                    .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i))
-                                                    .build()
+                                                    .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
                                                 sheetMode = null
                                             }
                                         }
                                     }
                                 }
-                            }
-                            "quality" -> {
-                                item {
-                                    OptionRow("Auto (Best Available)", exoPlayer.trackSelectionParameters.overrides.isEmpty()) {
-                                        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
-                                            .clearOverridesOfType(C.TRACK_TYPE_VIDEO).build()
-                                        sheetMode = null
-                                    }
-                                }
-                                tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }.forEach { g ->
-                                    items(g.length) { i ->
-                                        val f = g.getTrackFormat(i)
-                                        val lbl = "${if (f.height > 0) "${f.height}p" else "Video $i"} ${if (f.bitrate > 0) "· ${f.bitrate / 1000} kbps" else ""}"
-                                        OptionRow(lbl, g.isTrackSelected(i)) {
-                                            exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
-                                                .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
-                                            sheetMode = null
+                                "subs" -> {
+                                    item {
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                            OutlinedButton(onClick = { subOffsetMs -= 500L }) { Text("-0.5s", color = Color.White) }
+                                            OutlinedButton(onClick = { subOffsetMs += 500L }) { Text("+0.5s", color = Color.White) }
+                                            Text("${subOffsetMs / 1000f}s", color = Color.White, fontSize = 12.sp)
+                                            OutlinedButton(onClick = { subSizeSp = if (subSizeSp == 18) 23 else if (subSizeSp == 23) 14 else 18 }) {
+                                                Text("${subSizeSp}sp", color = Color.White)
+                                            }
                                         }
                                     }
-                                }
-                            }
-                            "subs" -> {
-                                item {
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        OutlinedButton(onClick = { subOffsetMs -= 500L }) { Text("-0.5s") }
-                                        OutlinedButton(onClick = { subOffsetMs += 500L }) { Text("+0.5s") }
-                                        Text("${subOffsetMs / 1000f}s", fontSize = 12.sp)
-                                        OutlinedButton(onClick = { subSizeSp = if (subSizeSp == 18) 23 else if (subSizeSp == 23) 14 else 18 }) { Text("${subSizeSp}sp") }
-                                    }
-                                }
-                                item {
-                                    OptionRow("Turn All Subtitles Off", activeExtLabel == "None" && exoPlayer.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)) {
-                                        activeCues = emptyList(); activeExtLabel = "None"
-                                        exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
-                                        sheetMode = null
-                                    }
-                                }
-                                item {
-                                    OptionRow("Load local .srt / .vtt from phone", activeExtLabel == "Local File") {
-                                        localSubPicker.launch("*/*")
-                                    }
-                                }
-                                tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEach { g ->
-                                    items(g.length) { i ->
-                                        val f = g.getTrackFormat(i)
-                                        val lbl = "Embedded: ${listOfNotNull(f.label, f.language?.uppercase()).joinToString(" ")}"
-                                        OptionRow(lbl, g.isTrackSelected(i) && activeExtLabel == "None") {
+                                    item {
+                                        OptionRow("Turn All Subtitles Off", activeExtLabel == "None" && exoPlayer.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_TEXT)) {
                                             activeCues = emptyList(); activeExtLabel = "None"
-                                            exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
-                                                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
-                                                .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
+                                            exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
                                             sheetMode = null
                                         }
                                     }
-                                }
-                                items(extSubs) { sub ->
-                                    val lbl = "${sub.lang.uppercase()} · ${sub.id.take(18)}"
-                                    OptionRow(lbl, activeExtLabel == lbl) {
-                                        scope.launch {
-                                            runCatching { Engine.fetchText(sub.url) }.onSuccess {
-                                                activeCues = Engine.parseSubtitles(it)
-                                                activeExtLabel = lbl
-                                                exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+                                    item {
+                                        OptionRow("Load local .srt / .vtt from phone", activeExtLabel == "Local File") {
+                                            localSubPicker.launch("*/*")
+                                        }
+                                    }
+                                    tracks.groups.filter { it.type == C.TRACK_TYPE_TEXT }.forEach { g ->
+                                        items(g.length) { i ->
+                                            val f = g.getTrackFormat(i)
+                                            val lbl = "Embedded: ${listOfNotNull(f.label, f.language?.uppercase()).joinToString(" ")}"
+                                            OptionRow(lbl, g.isTrackSelected(i) && activeExtLabel == "None") {
+                                                activeCues = emptyList(); activeExtLabel = "None"
+                                                exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon()
+                                                    .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                                                    .setOverrideForType(TrackSelectionOverride(g.mediaTrackGroup, i)).build()
                                                 sheetMode = null
-                                            }.onFailure { hudText = "Subtitle failed" }
+                                            }
+                                        }
+                                    }
+                                    items(extSubs) { sub ->
+                                        val lbl = "${sub.lang.uppercase()} · ${sub.id.take(18)}"
+                                        OptionRow(lbl, activeExtLabel == lbl) {
+                                            scope.launch {
+                                                runCatching { Engine.fetchText(sub.url) }.onSuccess {
+                                                    activeCues = Engine.parseSubtitles(it)
+                                                    activeExtLabel = lbl
+                                                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+                                                    sheetMode = null
+                                                }.onFailure { hudText = "Subtitle failed" }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            "sources" -> {
-                                items(session.allStreams) { s ->
-                                    val cur = s.url == session.stream.url
-                                    OptionRow("${s.addonName}: ${s.title.replace("\n", " · ").take(65)}", cur) {
-                                        sheetMode = null
-                                        if (!cur) onSwitchSession(session.copy(stream = s))
+                                "sources" -> {
+                                    items(session.allStreams) { s ->
+                                        val cur = s.url == session.stream.url
+                                        OptionRow("${s.addonName}: ${s.title.replace("\n", " · ").take(75)}", cur) {
+                                            sheetMode = null
+                                            if (!cur) onSwitchSession(session.copy(stream = s))
+                                        }
                                     }
                                 }
-                            }
-                            "episodes" -> {
-                                items(session.episodes) { ep ->
-                                    val lb = "S${ep.season}E${ep.episode}"
-                                    OptionRow("$lb · ${ep.title}", ep.id == session.vid) {
-                                        sheetMode = null
-                                        if (ep.id != session.vid) loadEpisode(ep)
+                                "episodes" -> {
+                                    items(session.episodes) { ep ->
+                                        val lb = "S${ep.season}E${ep.episode}"
+                                        OptionRow("$lb · ${ep.title}", ep.id == session.vid) {
+                                            sheetMode = null
+                                            if (ep.id != session.vid) loadEpisode(ep)
+                                        }
                                     }
                                 }
                             }
@@ -1416,18 +1421,81 @@ fun PlayerScreen(
 }
 
 @Composable
+fun PlayerSeekBar(
+    posMs: Long,
+    durMs: Long,
+    onSeekPreview: (Long) -> Unit,
+    onSeekCommit: (Long) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var widthPx by remember { mutableIntStateOf(1) }
+    val frac = if (durMs > 0L) (posMs.toFloat() / durMs).coerceIn(0f, 1f) else 0f
+
+    BoxWithConstraints(
+        modifier
+            .height(28.dp)
+            .onSizeChanged { widthPx = it.width.coerceAtLeast(1) }
+            .pointerInput(durMs) {
+                detectTapGestures { offset ->
+                    if (durMs > 0L) onSeekCommit(((offset.x / widthPx).coerceIn(0f, 1f) * durMs).toLong())
+                }
+            }
+            .pointerInput(durMs) {
+                var dragX = 0f
+                detectHorizontalDragGestures(
+                    onDragStart = { start ->
+                        dragX = start.x
+                        if (durMs > 0L) onSeekPreview(((dragX / widthPx).coerceIn(0f, 1f) * durMs).toLong())
+                    },
+                    onHorizontalDrag = { _, delta ->
+                        dragX = (dragX + delta).coerceIn(0f, widthPx.toFloat())
+                        if (durMs > 0L) onSeekPreview(((dragX / widthPx).coerceIn(0f, 1f) * durMs).toLong())
+                    },
+                    onDragEnd = {
+                        if (durMs > 0L) onSeekCommit(((dragX / widthPx).coerceIn(0f, 1f) * durMs).toLong())
+                    }
+                )
+            },
+        contentAlignment = Alignment.CenterStart
+    ) {
+        Box(Modifier.fillMaxWidth().height(4.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.28f)))
+        Box(Modifier.fillMaxWidth(frac).height(4.dp).clip(CircleShape).background(AccentPink))
+        val thumbX = (maxWidth * frac - 7.dp).coerceIn(0.dp, (maxWidth - 14.dp).coerceAtLeast(0.dp))
+        Box(Modifier.offset(x = thumbX).size(14.dp).clip(CircleShape).background(AccentPink))
+    }
+}
+
+@Composable
+fun PlayerPill(text: String, icon: ImageVector?, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .clip(CircleShape)
+            .background(Color.White.copy(alpha = 0.14f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (icon != null) {
+            Icon(icon, null, tint = Color.White, modifier = Modifier.size(15.dp))
+            Spacer(Modifier.width(5.dp))
+        }
+        Text(text, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
+@Composable
 fun OptionRow(label: String, selected: Boolean, onClick: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .background(if (selected) AccentPink.copy(alpha = 0.22f) else CardDark)
+            .background(if (selected) AccentPink.copy(alpha = 0.24f) else Color.White.copy(alpha = 0.06f))
             .clickable(onClick = onClick)
             .padding(12.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        Text(label, fontSize = 13.sp, color = Color.White, modifier = Modifier.weight(1f))
         if (selected) Icon(Icons.Rounded.Check, null, tint = AccentPink, modifier = Modifier.size(18.dp))
     }
 }
