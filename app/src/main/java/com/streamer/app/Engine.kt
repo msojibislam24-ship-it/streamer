@@ -152,6 +152,9 @@ object Engine {
 
     suspend fun fetchManifest(base: String): Addon {
         val j = JSONObject(fetchText("$base/manifest.json"))
+        if (!j.has("resources") && (j.has("scrapers") || j.has("providers") || j.has("plugins"))) {
+            error("JS_REPO")
+        }
         val types = j.optJSONArray("types").toStringList()
         val prefixes = j.optJSONArray("idPrefixes")?.toStringList()
         val cats = mutableListOf<CatalogDef>()
@@ -201,14 +204,15 @@ object Engine {
             val o = arr.optJSONObject(i) ?: continue
             val fn = o.optString("filename").ifBlank { o.optString("url") }.ifBlank { o.optString("file") }
             if (fn.isBlank()) continue
-            val scriptUrl = if (fn.startsWith("http", true)) fn else "$baseDir/${fn.trimStart('/')}"
+            val cleanFn = fn.removePrefix("./").trimStart('/')
+            val scriptUrl = if (fn.startsWith("http", true)) fn else "$baseDir/$cleanFn"
             out += JsPlugin(
                 id = o.optString("id").ifBlank { o.optString("name") },
                 name = o.optString("name").ifBlank { o.optString("id") },
                 version = o.optString("version", "1.0"),
                 scriptUrl = scriptUrl,
                 repoUrl = clean,
-                enabled = true
+                enabled = i < 8
             )
         }
         return out
