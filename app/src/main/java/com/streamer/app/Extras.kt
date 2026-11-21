@@ -182,10 +182,11 @@ class JsRunner(context: Context) {
               try {
                 var module = { exports: {} };
                 var exports = module.exports;
+                var getStreams;
                 var TMDB_ID = ${JSONObject.quote(tmdb)};
                 var MEDIA_TITLE = $titleJson;
                 eval(b64dec('$scriptB64'));
-                const fn = (module.exports && (module.exports.getStreams || module.exports.default)) || exports.getStreams || window.getStreams;
+                const fn = (module.exports && (module.exports.getStreams || module.exports.default)) || exports.getStreams || getStreams;
                 if(typeof fn !== 'function'){
                   _native.finishRun('$runId', '[]');
                   return;
