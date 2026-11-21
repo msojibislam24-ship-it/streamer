@@ -88,9 +88,14 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.disk.DiskCache
 import coil.memory.MemoryCache
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.SearchResponse
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
 
@@ -137,6 +142,17 @@ private fun extractStreamBadges(s: StreamItem): List<Pair<String, Color>> {
     return out
 }
 
+private fun getSavedCsRepos(ctx: Context): List<String> {
+    val sp = ctx.getSharedPreferences("streamer_prefs", Context.MODE_PRIVATE)
+    val arr = runCatching { JSONArray(sp.getString("cs_repos", "[]")) }.getOrNull() ?: return emptyList()
+    return List(arr.length()) { arr.optString(it) }.filter { it.isNotBlank() }
+}
+
+private fun saveCsRepos(ctx: Context, repos: List<String>) {
+    val sp = ctx.getSharedPreferences("streamer_prefs", Context.MODE_PRIVATE)
+    sp.edit().putString("cs_repos", JSONArray(repos.distinct()).toString()).apply()
+}
+
 data class PlaySession(
     val stream: StreamItem,
     val title: String,
@@ -145,7 +161,19 @@ data class PlaySession(
     val epLabel: String,
     val allStreams: List<StreamItem>,
     val episodes: List<VideoEp>,
-    val fromParty: Boolean = false
+    val fromParty: Boolean = false,
+    val csApi: MainAPI? = null,
+    val extraSubs: List<SubItem> = emptyList()
+)
+
+data class SearchHit(
+    val title: String,
+    val poster: String?,
+    val badge: String?,
+    val type: String,
+    val stremio: MetaItem? = null,
+    val csApi: MainAPI? = null,
+    val csRes: SearchResponse? = null
 )
 
 class MainActivity : ComponentActivity() {
@@ -153,7 +181,6 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Fast Memory + Disk Cache for Posters & Thumbnails
         val loader = ImageLoader.Builder(applicationContext)
             .okHttpClient(Engine.http)
             .memoryCache { MemoryCache.Builder(applicationContext).maxSizePercent(0.25).build() }
@@ -195,9 +222,12 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
     var tab by remember { mutableStateOf("home") }
     var addons by remember { mutableStateOf(store.getAddonBases().map { Addon(it, it) }) }
     var jsPlugins by remember { mutableStateOf(store.getJsPlugins()) }
+    var csProviders by remember { mutableStateOf<List<CsLoadedProvider>>(emptyList()) }
+    var csRepos by remember { mutableStateOf(getSavedCsRepos(ctx)) }
     var favs by remember { mutableStateOf(store.getFavs()) }
     var history by remember { mutableStateOf(store.getHistory()) }
     var selectedItem by remember { mutableStateOf<MetaItem?>(null) }
+    var selectedCs by remember { mutableStateOf<Pair<MainAPI, SearchResponse>?>(null) }
     var activePlayer by remember { mutableStateOf<PlaySession?>(null) }
     var showPartyDialog by remember { mutableStateOf(false) }
     var cfUrl by remember { mutableStateOf<String?>(null) }
@@ -211,8 +241,10 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
     }
 
     LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { CsEngine.loadAllInstalled(ctx) }
+        csProviders = CsEngine.loadedProviders.toList()
         refreshAllAddons()
-        delay(650L)
+        delay(600L)
         showSplash = false
     }
 
@@ -245,9 +277,7 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
         return
     }
 
-    if (cfUrl != null) {
-        CloudflareSolverDialog(cfUrl!!) { cfUrl = null }
-    }
+    if (cfUrl != null) CloudflareSolverDialog(cfUrl!!) { cfUrl = null }
 
     if (showPartyDialog) {
         PartyDialog(
@@ -265,15 +295,9 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
             if (party.code != null && !session.fromParty && session.stream.url != null) {
                 party.send(
                     JSONObject()
-                        .put("t", "play")
-                        .put("url", session.stream.url)
-                        .put("title", session.title)
-                        .put("id", session.meta.id)
-                        .put("type", session.meta.type)
-                        .put("name", session.meta.name)
-                        .put("poster", session.meta.poster ?: "")
-                        .put("vid", session.vid)
-                        .put("lab", session.epLabel)
+                        .put("t", "play").put("url", session.stream.url).put("title", session.title)
+                        .put("id", session.meta.id).put("type", session.meta.type).put("name", session.meta.name)
+                        .put("poster", session.meta.poster ?: "").put("vid", session.vid).put("lab", session.epLabel)
                 )
             }
         }
@@ -305,6 +329,20 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
                 store.saveHistory(updated)
             },
             onClose = { activePlayer = null }
+        )
+        return
+    }
+
+    if (selectedCs != null) {
+        val (api, sr) = selectedCs!!
+        BackHandler { selectedCs = null }
+        CsDetailScreen(
+            api = api,
+            sr = sr,
+            store = store,
+            onPlay = { activePlayer = it },
+            onSolveCf = { cfUrl = it },
+            onBack = { selectedCs = null }
         )
         return
     }
@@ -377,8 +415,20 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
         Box(Modifier.padding(pad).fillMaxSize()) {
             when (tab) {
                 "home" -> HomeScreen(addons, history, favs, onOpen = { selectedItem = it }, onGoAddons = { tab = "addons" })
-                "discover" -> DiscoverScreen(addons, onOpen = { selectedItem = it })
-                "search" -> SearchScreen(addons, store, onOpen = { selectedItem = it })
+                "discover" -> DiscoverScreen(
+                    addons = addons,
+                    csProviders = csProviders,
+                    onOpenStremio = { selectedItem = it },
+                    onOpenCs = { api, sr -> selectedCs = api to sr },
+                    onGoAddons = { tab = "addons" }
+                )
+                "search" -> SearchScreen(
+                    addons = addons,
+                    csProviders = csProviders,
+                    store = store,
+                    onOpenStremio = { selectedItem = it },
+                    onOpenCs = { api, sr -> selectedCs = api to sr }
+                )
                 "downloads" -> DownloadsScreen(onPlayOffline = { entry ->
                     val s = StreamItem(entry.localUri, null, entry.title, "Offline")
                     val m = MetaItem(entry.localUri ?: "dl_${entry.id}", "movie", entry.title)
@@ -387,6 +437,8 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
                 "addons" -> AddonsScreen(
                     addons = addons,
                     jsPlugins = jsPlugins,
+                    csProviders = csProviders,
+                    csRepos = csRepos,
                     store = store,
                     onAddStremio = { raw ->
                         val base = Engine.toBase(raw)
@@ -404,6 +456,12 @@ fun StreamerApp(store: Store, jsRunner: JsRunner, party: PartyClient) {
                         store.saveJsPlugins(merged)
                         null
                     },
+                    onSaveCsRepoUrl = { url ->
+                        csRepos = (listOf(url) + csRepos).distinct()
+                        saveCsRepos(ctx, csRepos)
+                    },
+                    onCsProvidersChanged = { csProviders = CsEngine.loadedProviders.toList() },
+                    onBrowseCs = { tab = "discover" },
                     onToggleJs = { idx ->
                         jsPlugins = jsPlugins.toMutableList().also { it[idx] = it[idx].copy(enabled = !it[idx].enabled) }
                         store.saveJsPlugins(jsPlugins)
@@ -458,8 +516,7 @@ fun PartyDialog(party: PartyClient, onHost: (String) -> Unit, onJoin: (String) -
                 } else {
                     Button(onClick = {
                         val chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-                        val code = (1..4).map { chars.random() }.joinToString("")
-                        onHost(code)
+                        onHost((1..4).map { chars.random() }.joinToString(""))
                     }, modifier = Modifier.fillMaxWidth()) { Text("Host a New Room") }
                     HorizontalDivider()
                     OutlinedTextField(value = codeInp, onValueChange = { codeInp = it.uppercase().take(4) }, label = { Text("4-Letter Room Code") }, singleLine = true)
@@ -472,13 +529,7 @@ fun PartyDialog(party: PartyClient, onHost: (String) -> Unit, onJoin: (String) -
 }
 
 @Composable
-fun HomeScreen(
-    addons: List<Addon>,
-    history: List<HistoryItem>,
-    favs: List<MetaItem>,
-    onOpen: (MetaItem) -> Unit,
-    onGoAddons: () -> Unit
-) {
+fun HomeScreen(addons: List<Addon>, history: List<HistoryItem>, favs: List<MetaItem>, onOpen: (MetaItem) -> Unit, onGoAddons: () -> Unit) {
     val catalogs = remember(addons) { addons.flatMap { a -> a.catalogs.filter { !it.extraRequired }.map { a to it } }.take(10) }
     val rows = remember { mutableStateMapOf<String, List<MetaItem>>() }
     var featured by remember { mutableStateOf<MetaItem?>(null) }
@@ -576,37 +627,107 @@ fun HomeScreen(
 }
 
 @Composable
-fun DiscoverScreen(addons: List<Addon>, onOpen: (MetaItem) -> Unit) {
-    val catalogs = remember(addons) { addons.flatMap { a -> a.catalogs.filter { !it.extraRequired }.map { a to it } } }
-    var selIdx by remember { mutableIntStateOf(0) }
-    var selGenre by remember { mutableStateOf("All") }
-    var selYear by remember { mutableStateOf("All") }
-    var items by remember { mutableStateOf<List<MetaItem>>(emptyList()) }
-    var loading by remember { mutableStateOf(false) }
-
-    val current = catalogs.getOrNull(selIdx)
-    val genres = remember(current) {
-        val g = current?.second?.genres.orEmpty()
-        listOf("All") + (if (g.isNotEmpty()) g else listOf("Action", "Adventure", "Animation", "Comedy", "Crime", "Drama", "Horror", "Sci-Fi", "Thriller"))
-    }
-
-    val loadPage: suspend (Int, Boolean) -> Unit = { skip, append ->
-        if (current != null) {
-            loading = true
-            runCatching { Engine.fetchCatalog(current.first.base, current.second.type, current.second.id, genre = selGenre, skip = skip) }
-                .onSuccess { res -> items = if (append) (items + res).distinctBy { it.type + it.id } else res }
-            loading = false
-        }
-    }
-
-    LaunchedEffect(selIdx, selGenre) { loadPage(0, false) }
+fun DiscoverScreen(
+    addons: List<Addon>,
+    csProviders: List<CsLoadedProvider>,
+    onOpenStremio: (MetaItem) -> Unit,
+    onOpenCs: (MainAPI, SearchResponse) -> Unit,
+    onGoAddons: () -> Unit
+) {
+    var mode by remember { mutableStateOf(if (csProviders.isNotEmpty()) "cs3" else "stremio") }
 
     Column(Modifier.fillMaxSize()) {
+        Row(Modifier.padding(horizontal = 14.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = mode == "cs3", onClick = { mode = "cs3" }, label = { Text("CloudStream (${csProviders.size})") })
+            FilterChip(selected = mode == "stremio", onClick = { mode = "stremio" }, label = { Text("Stremio Catalogs") })
+        }
+
+        if (mode == "cs3") {
+            if (csProviders.isEmpty()) {
+                Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                    Text("No CloudStream (.cs3) extensions installed yet.", color = TextMut, textAlign = TextAlign.Center)
+                    Spacer(Modifier.height(10.dp))
+                    Button(onClick = onGoAddons) { Text("Add Shortcode / Repo in Addons") }
+                }
+                return
+            }
+
+            var selProvIdx by remember { mutableIntStateOf(0) }
+            val activeApi = csProviders.getOrNull(selProvIdx)?.api
+            var sections by remember { mutableStateOf<List<Pair<String, List<SearchResponse>>>>(emptyList()) }
+            var page by remember { mutableIntStateOf(1) }
+            var loading by remember { mutableStateOf(false) }
+
+            LaunchedEffect(activeApi, page) {
+                activeApi ?: return@LaunchedEffect
+                loading = true
+                val res = runCatching { CsEngine.getMainSections(activeApi, page) }.getOrDefault(emptyList())
+                sections = if (page == 1) res else (sections + res)
+                loading = false
+            }
+
+            LazyRow(contentPadding = PaddingValues(horizontal = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(csProviders.size) { i ->
+                    FilterChip(
+                        selected = selProvIdx == i,
+                        onClick = { selProvIdx = i; page = 1; sections = emptyList() },
+                        label = { Text(csProviders[i].api.name) }
+                    )
+                }
+            }
+            if (loading) LinearProgressIndicator(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp))
+
+            LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 24.dp)) {
+                items(sections) { (secTitle, items) ->
+                    SectionTitle(secTitle, activeApi?.name ?: "CS3")
+                    LazyRow(contentPadding = PaddingValues(horizontal = 14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        items(items) { sr ->
+                            PosterCard(sr.name, sr.posterUrl, sr.type?.name) {
+                                activeApi?.let { onOpenCs(it, sr) }
+                            }
+                        }
+                    }
+                }
+                if (sections.isNotEmpty() && !loading) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                            OutlinedButton(onClick = { page += 1 }) { Text("Load Page ${page + 1}") }
+                        }
+                    }
+                }
+            }
+            return
+        }
+
+        // Stremio Discover
+        val catalogs = remember(addons) { addons.flatMap { a -> a.catalogs.filter { !it.extraRequired }.map { a to it } } }
+        var selIdx by remember { mutableIntStateOf(0) }
+        var selGenre by remember { mutableStateOf("All") }
+        var selYear by remember { mutableStateOf("All") }
+        var items by remember { mutableStateOf<List<MetaItem>>(emptyList()) }
+        var loading by remember { mutableStateOf(false) }
+        val current = catalogs.getOrNull(selIdx)
+        val genres = remember(current) {
+            val g = current?.second?.genres.orEmpty()
+            listOf("All") + (if (g.isNotEmpty()) g else listOf("Action", "Adventure", "Animation", "Comedy", "Crime", "Drama", "Horror", "Sci-Fi", "Thriller"))
+        }
+
+        val loadPage: suspend (Int, Boolean) -> Unit = { skip, append ->
+            if (current != null) {
+                loading = true
+                runCatching { Engine.fetchCatalog(current.first.base, current.second.type, current.second.id, genre = selGenre, skip = skip) }
+                    .onSuccess { res -> items = if (append) (items + res).distinctBy { it.type + it.id } else res }
+                loading = false
+            }
+        }
+
+        LaunchedEffect(selIdx, selGenre) { loadPage(0, false) }
+
         if (catalogs.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No catalogs available.", color = TextMut) }
             return
         }
-        LazyRow(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyRow(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             items(catalogs.size) { i ->
                 val c = catalogs[i].second
                 FilterChip(selected = selIdx == i, onClick = { selIdx = i; selGenre = "All" }, label = { Text("${c.name} (${c.type})") })
@@ -641,7 +762,7 @@ fun DiscoverScreen(addons: List<Addon>, onOpen: (MetaItem) -> Unit) {
             modifier = Modifier.weight(1f)
         ) {
             items(filtered, key = { "${it.type}_${it.id}" }) { m ->
-                PosterCard(m.name, m.poster, m.releaseInfo ?: m.imdbRating?.let { "★ $it" }) { onOpen(m) }
+                PosterCard(m.name, m.poster, m.releaseInfo ?: m.imdbRating?.let { "★ $it" }) { onOpenStremio(m) }
             }
             if (items.isNotEmpty() && !loading) {
                 item {
@@ -669,7 +790,7 @@ fun DownloadsScreen(onPlayOffline: (DownloadEntry) -> Unit) {
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item { SectionTitle("Downloads", "${entries.size} files") }
         if (entries.isEmpty()) {
-            item { Text("No downloads yet. Open any movie/episode and tap Download on a stream.", color = TextMut, modifier = Modifier.padding(top = 12.dp)) }
+            item { Text("No downloads yet. Open any movie/episode and tap Save on a stream.", color = TextMut, modifier = Modifier.padding(top = 12.dp)) }
         } else {
             items(entries, key = { it.id }) { e ->
                 val pct = if (e.totalBytes > 0) (e.downloadedBytes.toFloat() / e.totalBytes).coerceIn(0f, 1f) else 0f
@@ -692,14 +813,9 @@ fun DownloadsScreen(onPlayOffline: (DownloadEntry) -> Unit) {
                         Spacer(Modifier.height(8.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             if (done) {
-                                Button(onClick = { onPlayOffline(e) }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
-                                    Text("▶ Play Offline")
-                                }
+                                Button(onClick = { onPlayOffline(e) }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) { Text("▶ Play Offline") }
                             }
-                            OutlinedButton(onClick = {
-                                DownloadHelper.remove(ctx, e.id)
-                                entries = DownloadHelper.list(ctx)
-                            }) { Text("Delete", color = TextWhite) }
+                            OutlinedButton(onClick = { DownloadHelper.remove(ctx, e.id); entries = DownloadHelper.list(ctx) }) { Text("Delete", color = TextWhite) }
                         }
                     }
                 }
@@ -742,12 +858,18 @@ fun PosterCard(name: String, poster: String?, sub: String? = null, progress: Flo
 }
 
 @Composable
-fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) {
+fun SearchScreen(
+    addons: List<Addon>,
+    csProviders: List<CsLoadedProvider>,
+    store: Store,
+    onOpenStremio: (MetaItem) -> Unit,
+    onOpenCs: (MainAPI, SearchResponse) -> Unit
+) {
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
     var searching by remember { mutableStateOf(false) }
-    var filter by remember { mutableStateOf("all") }
-    var results by remember { mutableStateOf<List<MetaItem>>(emptyList()) }
+    var srcFilter by remember { mutableStateOf("all") } // all, cs3, stremio
+    var results by remember { mutableStateOf<List<SearchHit>>(emptyList()) }
     var recents by remember { mutableStateOf(store.getRecentSearches()) }
 
     val runSearch: (String) -> Unit = { q ->
@@ -756,20 +878,33 @@ fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) 
             store.addRecentSearch(trimmed)
             recents = store.getRecentSearches()
             searching = true
+            results = emptyList()
             scope.launch {
                 val cats = addons.flatMap { a -> a.catalogs.filter { it.hasSearch }.map { a to it } }
-                val seen = HashSet<String>()
-                val found = mutableListOf<MetaItem>()
-                for ((a, c) in cats) {
-                    runCatching { Engine.fetchCatalog(a.base, c.type, c.id, query = trimmed) }
-                        .onSuccess { list ->
-                            for (m in list) {
-                                val k = "${m.type}:${m.id}"
-                                if (seen.add(k)) found += m.copy(source = a.name)
+                val stremioJob = async {
+                    val seen = HashSet<String>()
+                    val out = mutableListOf<SearchHit>()
+                    for ((a, c) in cats) {
+                        runCatching { Engine.fetchCatalog(a.base, c.type, c.id, query = trimmed) }
+                            .onSuccess { list ->
+                                for (m in list) {
+                                    if (seen.add("${m.type}:${m.id}")) {
+                                        out += SearchHit(m.name, m.poster, a.name, "stremio", stremio = m.copy(source = a.name))
+                                    }
+                                }
                             }
-                        }
+                    }
+                    out
                 }
-                results = found
+                val csJobs = csProviders.map { p ->
+                    async {
+                        CsEngine.search(p.api, trimmed).map { sr ->
+                            SearchHit(sr.name, sr.posterUrl, p.api.name, "cs3", csApi = p.api, csRes = sr)
+                        }
+                    }
+                }
+                val combined = csJobs.flatMap { it.await() } + stremioJob.await()
+                results = combined
                 searching = false
             }
         }
@@ -778,14 +913,12 @@ fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) 
     Column(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
         Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                placeholder = { Text("Search movies, series, or tt IMDb ID") },
+                value = query, onValueChange = { query = it },
+                placeholder = { Text("Search movies, anime, or tt IMDb ID") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { runSearch(query) }),
-                modifier = Modifier.weight(1f),
-                shape = RoundedCornerShape(14.dp)
+                modifier = Modifier.weight(1f), shape = RoundedCornerShape(14.dp)
             )
             Spacer(Modifier.width(8.dp))
             Button(onClick = { runSearch(query) }) { Text("Go") }
@@ -794,8 +927,8 @@ fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) 
         if (Regex("^tt\\d{5,}$", RegexOption.IGNORE_CASE).matches(query.trim())) {
             val tt = query.trim()
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 8.dp)) {
-                Button(onClick = { onOpen(MetaItem(tt, "movie", tt)) }) { Text("Open $tt as Movie") }
-                OutlinedButton(onClick = { onOpen(MetaItem(tt, "series", tt)) }) { Text("As Series") }
+                Button(onClick = { onOpenStremio(MetaItem(tt, "movie", tt)) }) { Text("Open $tt as Movie") }
+                OutlinedButton(onClick = { onOpenStremio(MetaItem(tt, "series", tt)) }) { Text("As Series") }
             }
         }
 
@@ -808,14 +941,14 @@ fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) 
 
         if (results.isNotEmpty()) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 6.dp)) {
-                listOf("all" to "All (${results.size})", "movie" to "Movies", "series" to "Series").forEach { (k, lbl) ->
-                    FilterChip(selected = filter == k, onClick = { filter = k }, label = { Text(lbl) })
+                listOf("all" to "All (${results.size})", "cs3" to "CS3 (${results.count { it.type == "cs3" }})", "stremio" to "Stremio").forEach { (k, lbl) ->
+                    FilterChip(selected = srcFilter == k, onClick = { srcFilter = k }, label = { Text(lbl) })
                 }
             }
         }
         if (searching) LinearProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 8.dp))
 
-        val filtered = if (filter == "all") results else results.filter { it.type == filter }
+        val filtered = if (srcFilter == "all") results else results.filter { it.type == srcFilter }
         LazyVerticalGrid(
             columns = GridCells.Adaptive(108.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -823,8 +956,209 @@ fun SearchScreen(addons: List<Addon>, store: Store, onOpen: (MetaItem) -> Unit) 
             contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
             modifier = Modifier.fillMaxSize()
         ) {
-            items(filtered, key = { "${it.type}_${it.id}" }) { m ->
-                PosterCard(m.name, m.poster, m.source ?: m.releaseInfo) { onOpen(m) }
+            items(filtered) { hit ->
+                PosterCard(hit.title, hit.poster, hit.badge) {
+                    if (hit.stremio != null) onOpenStremio(hit.stremio)
+                    else if (hit.csApi != null && hit.csRes != null) onOpenCs(hit.csApi, hit.csRes)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CsDetailScreen(
+    api: MainAPI,
+    sr: SearchResponse,
+    store: Store,
+    onPlay: (PlaySession) -> Unit,
+    onSolveCf: (String) -> Unit,
+    onBack: () -> Unit
+) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var detail by remember { mutableStateOf<CsMediaDetail?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var selectedSeason by remember { mutableIntStateOf(-1) }
+    var rangeIdx by remember { mutableIntStateOf(0) }
+    var epJump by remember { mutableStateOf("") }
+    var loadingLinks by remember { mutableStateOf(false) }
+    var streamList by remember { mutableStateOf<List<StreamItem>?>(null) }
+    var subList by remember { mutableStateOf<List<SubItem>>(emptyList()) }
+    var activeVid by remember { mutableStateOf("") }
+    var activeEpLabel by remember { mutableStateOf("") }
+
+    LaunchedEffect(sr.url) {
+        loading = true
+        detail = runCatching { CsEngine.loadDetail(api, sr.url) }.getOrNull()
+        detail?.let { d ->
+            val seasons = d.episodes.map { it.season }.distinct().sorted()
+            selectedSeason = if (d.episodes.size > 120 || seasons.size <= 1) -1 else seasons.first()
+        }
+        loading = false
+    }
+
+    val findLinks: (String, String) -> Unit = { data, lab ->
+        activeVid = data
+        activeEpLabel = lab
+        loadingLinks = true
+        streamList = null
+        scope.launch {
+            val (ss, subs) = CsEngine.loadLinks(api, data)
+            streamList = ss
+            subList = subs
+            loadingLinks = false
+        }
+    }
+
+    val epsAll = detail?.episodes.orEmpty()
+    val seasonEps = remember(epsAll, selectedSeason) {
+        if (selectedSeason == -1) epsAll else epsAll.filter { it.season == selectedSeason }
+    }
+    val chunkedEps = remember(seasonEps, rangeIdx, epJump) {
+        val j = epJump.trim().toIntOrNull()
+        if (j != null) seasonEps.filterIndexed { idx, ep -> ep.episode == j || (idx + 1) == j }
+        else if (seasonEps.size > 50) seasonEps.drop(rangeIdx * 100).take(100)
+        else seasonEps
+    }
+
+    LazyColumn(Modifier.fillMaxSize().background(BgDark), contentPadding = PaddingValues(bottom = 32.dp)) {
+        item {
+            Box(Modifier.fillMaxWidth()) {
+                AsyncImage(model = detail?.backgroundUrl ?: sr.posterUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.matchParentSize().blur(18.dp))
+                Box(Modifier.matchParentSize().background(Brush.verticalGradient(listOf(Color(0x660A0A0F), BgDark))))
+                Column(Modifier.statusBarsPadding().padding(14.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        IconButton(onClick = onBack, modifier = Modifier.background(Color.Black.copy(0.55f), CircleShape)) {
+                            Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back", tint = Color.White)
+                        }
+                        IconButton(onClick = { onSolveCf(api.mainUrl) }, modifier = Modifier.background(Color.Black.copy(0.55f), CircleShape)) {
+                            Icon(Icons.Rounded.Shield, "Bot Check", tint = Color.White)
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                        AsyncImage(
+                            model = detail?.posterUrl ?: sr.posterUrl, contentDescription = null, contentScale = ContentScale.Crop,
+                            modifier = Modifier.width(114.dp).aspectRatio(2f / 3f).clip(RoundedCornerShape(12.dp)).background(CardDark)
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(detail?.name ?: sr.name, fontSize = 22.sp, fontWeight = FontWeight.Bold, color = TextWhite)
+                            Text(api.name, color = AccentPink, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            val info = listOfNotNull(detail?.score?.let { "★ $it" }, detail?.year?.toString()).joinToString(" · ")
+                            if (info.isNotBlank()) Text(info, color = Color(0xFFFBBF24), fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+                            Spacer(Modifier.height(10.dp))
+                            if (epsAll.isNotEmpty()) {
+                                Button(onClick = {
+                                    val first = epsAll.first()
+                                    val lab = if (detail?.isMovie == true) "" else "S${first.season}E${first.episode}"
+                                    findLinks(first.id, lab)
+                                }) {
+                                    Icon(Icons.Rounded.PlayArrow, null, modifier = Modifier.size(18.dp))
+                                    Text(if (detail?.isMovie == true) "Find Streams" else "Play First Ep")
+                                }
+                            }
+                        }
+                    }
+                    detail?.plot?.let { Spacer(Modifier.height(10.dp)); Text(it, fontSize = 13.sp, color = Color(0xFFCBC7DC)) }
+                }
+            }
+        }
+
+        if (loading) item { LinearProgressIndicator(Modifier.fillMaxWidth().padding(14.dp)) }
+        if (loadingLinks) {
+            item {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp)); Text("Extracting links $activeEpLabel…", color = TextWhite)
+                }
+            }
+        }
+
+        streamList?.let { list ->
+            val playable = list.filter { it.url != null }
+            item { SectionTitle("Streams $activeEpLabel", "${list.size} found") }
+            if (list.isEmpty()) {
+                item { Text("No links found. If the site uses Cloudflare, tap the Shield icon at top-right to solve bot check.", color = TextMut, modifier = Modifier.padding(14.dp)) }
+            } else {
+                items(list) { s ->
+                    val playTitle = if (activeEpLabel.isNotBlank()) "${detail?.name ?: sr.name} $activeEpLabel" else (detail?.name ?: sr.name)
+                    val metaObj = MetaItem(sr.url, if (detail?.isMovie == true) "movie" else "series", detail?.name ?: sr.name, detail?.posterUrl ?: sr.posterUrl)
+                    Card(colors = CardDefaults.cardColors(containerColor = CardDark), modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(s.addonName.uppercase(), color = AccentPink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text(s.title, fontSize = 13.sp, color = TextWhite)
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = {
+                                    onPlay(PlaySession(s, playTitle, metaObj, activeVid, activeEpLabel, playable, epsAll, csApi = api, extraSubs = subList))
+                                }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) { Text("▶ Play") }
+                                OutlinedButton(onClick = {
+                                    DownloadHelper.enqueue(ctx, playTitle, s)
+                                    Toast.makeText(ctx, "Downloading…", Toast.LENGTH_SHORT).show()
+                                }) { Text("⬇ Save", color = TextWhite) }
+                                OutlinedButton(onClick = {
+                                    runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(s.url), "video/*")) }
+                                }) { Text("External", color = TextWhite) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (detail?.isMovie == false && epsAll.isNotEmpty()) {
+            val seasons = epsAll.map { it.season }.distinct().sorted()
+            item {
+                SectionTitle("Episodes", "${epsAll.size} total")
+                if (seasons.size > 1) {
+                    LazyRow(contentPadding = PaddingValues(horizontal = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        item { FilterChip(selected = selectedSeason == -1, onClick = { selectedSeason = -1; rangeIdx = 0 }, label = { Text("All (${epsAll.size})") }) }
+                        items(seasons) { sn ->
+                            FilterChip(selected = selectedSeason == sn, onClick = { selectedSeason = sn; rangeIdx = 0 }, label = { Text("Season $sn") })
+                        }
+                    }
+                }
+            }
+            if (seasonEps.size > 50) {
+                item {
+                    val chunks = (seasonEps.size + 99) / 100
+                    LazyRow(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(chunks) { cIdx ->
+                            FilterChip(selected = epJump.isBlank() && rangeIdx == cIdx, onClick = { epJump = ""; rangeIdx = cIdx }, label = { Text("${cIdx * 100 + 1}–${minOf((cIdx + 1) * 100, seasonEps.size)}") })
+                        }
+                    }
+                    Row(Modifier.padding(horizontal = 14.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = epJump, onValueChange = { epJump = it.filter { ch -> ch.isDigit() }.take(5) },
+                            placeholder = { Text("Jump to Ep #") }, singleLine = true, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)
+                        )
+                        if (epJump.isNotEmpty()) TextButton(onClick = { epJump = "" }) { Text("Clear") }
+                    }
+                }
+            }
+            items(chunkedEps) { ep ->
+                val done = store.isDone(ep.id)
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp)
+                        .clip(RoundedCornerShape(12.dp)).background(CardDark)
+                        .clickable { findLinks(ep.id, "S${ep.season}E${ep.episode}") }.padding(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(Modifier.width(100.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(8.dp)).background(BgDark), contentAlignment = Alignment.Center) {
+                        Text("S${ep.season}E${ep.episode}", fontSize = 11.sp, color = TextMut)
+                        AsyncImage(model = ep.thumbnail, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (done) { Icon(Icons.Rounded.Check, null, tint = Color(0xFF34D399), modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)) }
+                            Text("${ep.episode}. ${ep.title}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        ep.overview?.let { Text(it, fontSize = 12.sp, color = TextMut, maxLines = 2, overflow = TextOverflow.Ellipsis) }
+                    }
+                }
             }
         }
     }
@@ -848,7 +1182,7 @@ fun DetailScreen(
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var meta by remember { mutableStateOf(initial) }
-    var selectedSeason by remember { mutableIntStateOf(1) } // -1 = ALL
+    var selectedSeason by remember { mutableIntStateOf(1) }
     var rangeIdx by remember { mutableIntStateOf(0) }
     var epJump by remember { mutableStateOf("") }
     var loadingStreams by remember { mutableStateOf(false) }
@@ -870,33 +1204,21 @@ fun DetailScreen(
     }
 
     val findStreams: (String, String, Int, Int) -> Unit = { vid, epLab, sNum, eNum ->
-        activeVid = vid
-        activeEpLabel = epLab
-        loadingStreams = true
-        streamList = null
-        streamFilter = "ALL"
+        activeVid = vid; activeEpLabel = epLab; loadingStreams = true; streamList = null; streamFilter = "ALL"
         scope.launch {
             val stremioJob = async { Engine.fetchStreams(addons, meta.type, vid) }
-            val jsJobs = jsPlugins.filter { it.enabled }.map { p ->
-                async { runCatching { jsRunner.runScraper(p, meta, sNum, eNum) }.getOrDefault(emptyList()) }
-            }
+            val jsJobs = jsPlugins.filter { it.enabled }.map { p -> async { runCatching { jsRunner.runScraper(p, meta, sNum, eNum) }.getOrDefault(emptyList()) } }
             streamList = stremioJob.await() + jsJobs.flatMap { it.await() }
             loadingStreams = false
         }
     }
 
-    // Episode list after Season + Range Chunking (1-100, 101-200...) + Jump filter
-    val seasonEps = remember(meta.videos, selectedSeason) {
-        if (selectedSeason == -1) meta.videos else meta.videos.filter { it.season == selectedSeason }
-    }
+    val seasonEps = remember(meta.videos, selectedSeason) { if (selectedSeason == -1) meta.videos else meta.videos.filter { it.season == selectedSeason } }
     val chunkedEps = remember(seasonEps, rangeIdx, epJump) {
         val j = epJump.trim().toIntOrNull()
-        if (j != null) {
-            seasonEps.filterIndexed { idx, ep -> ep.episode == j || (idx + 1) == j }
-        } else if (seasonEps.size > 50) {
-            val start = rangeIdx * 100
-            seasonEps.drop(start).take(100)
-        } else seasonEps
+        if (j != null) seasonEps.filterIndexed { idx, ep -> ep.episode == j || (idx + 1) == j }
+        else if (seasonEps.size > 50) seasonEps.drop(rangeIdx * 100).take(100)
+        else seasonEps
     }
 
     LazyColumn(Modifier.fillMaxSize().background(BgDark), contentPadding = PaddingValues(bottom = 32.dp)) {
@@ -944,11 +1266,7 @@ fun DetailScreen(
                                     Icon(if (isFav) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder, null, tint = if (isFav) AccentPink else Color.White)
                                 }
                             }
-                            if (contItem != null) {
-                                TextButton(onClick = { onClearHist(meta.id) }, contentPadding = PaddingValues(0.dp)) {
-                                    Text("Clear progress", fontSize = 12.sp, color = TextMut)
-                                }
-                            }
+                            if (contItem != null) TextButton(onClick = { onClearHist(meta.id) }, contentPadding = PaddingValues(0.dp)) { Text("Clear progress", fontSize = 12.sp, color = TextMut) }
                         }
                     }
                     meta.description?.let { Spacer(Modifier.height(10.dp)); Text(it, fontSize = 13.sp, color = Color(0xFFCBC7DC)) }
@@ -960,8 +1278,7 @@ fun DetailScreen(
             item {
                 Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Text("Fetching streams $activeEpLabel…", color = TextWhite)
+                    Spacer(Modifier.width(12.dp)); Text("Fetching streams $activeEpLabel…", color = TextWhite)
                 }
             }
         }
@@ -972,9 +1289,7 @@ fun DetailScreen(
             if (list.size > 3) {
                 item {
                     LazyRow(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(listOf("ALL", "4K", "1080P", "720P")) { tag ->
-                            FilterChip(selected = streamFilter == tag, onClick = { streamFilter = tag }, label = { Text(tag) })
-                        }
+                        items(listOf("ALL", "4K", "1080P", "720P")) { tag -> FilterChip(selected = streamFilter == tag, onClick = { streamFilter = tag }, label = { Text(tag) }) }
                     }
                 }
             }
@@ -984,49 +1299,29 @@ fun DetailScreen(
                 "720P" -> list.filter { it.title.contains("720p", true) }
                 else -> list
             }
-            if (shown.isEmpty()) {
-                item { Text("No streams match $streamFilter.", color = TextMut, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) }
-            } else {
-                items(shown) { s ->
-                    val badges = remember(s) { extractStreamBadges(s) }
-                    Card(colors = CardDefaults.cardColors(containerColor = CardDark), modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp)) {
-                        Column(Modifier.padding(12.dp)) {
-                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                Text(s.addonName.uppercase(), color = AccentPink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                                    badges.forEach { (bTxt, bCol) ->
-                                        Text(
-                                            bTxt, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = bCol,
-                                            modifier = Modifier.clip(RoundedCornerShape(5.dp)).background(bCol.copy(alpha = 0.18f)).padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
-                                    }
+            if (shown.isEmpty()) item { Text("No streams match $streamFilter.", color = TextMut, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)) }
+            else items(shown) { s ->
+                val badges = remember(s) { extractStreamBadges(s) }
+                Card(colors = CardDefaults.cardColors(containerColor = CardDark), modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp)) {
+                    Column(Modifier.padding(12.dp)) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text(s.addonName.uppercase(), color = AccentPink, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                badges.forEach { (bTxt, bCol) ->
+                                    Text(bTxt, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = bCol, modifier = Modifier.clip(RoundedCornerShape(5.dp)).background(bCol.copy(alpha = 0.18f)).padding(horizontal = 6.dp, vertical = 2.dp))
                                 }
                             }
-                            Spacer(Modifier.height(5.dp))
-                            Text(s.title, fontSize = 13.sp, color = TextWhite)
-                            Spacer(Modifier.height(8.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                if (s.url != null) {
-                                    val playTitle = if (activeEpLabel.isNotBlank()) "${meta.name} $activeEpLabel" else meta.name
-                                    Button(onClick = { onPlay(PlaySession(s, playTitle, meta, activeVid, activeEpLabel, playable, meta.videos)) }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
-                                        Text("▶ Play")
-                                    }
-                                    OutlinedButton(onClick = {
-                                        DownloadHelper.enqueue(ctx, playTitle, s)
-                                        Toast.makeText(ctx, "Downloading in background…", Toast.LENGTH_SHORT).show()
-                                    }) { Text("⬇ Save", color = TextWhite) }
-                                    OutlinedButton(onClick = {
-                                        val i = Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(s.url), "video/*")
-                                        runCatching { ctx.startActivity(i) }
-                                    }) { Text("External", color = TextWhite) }
-                                } else if (s.externalUrl != null) {
-                                    OutlinedButton(onClick = { runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(s.externalUrl))) } }) {
-                                        Text("Open Link", color = TextWhite)
-                                    }
-                                } else {
-                                    Text("Torrent/P2P stream (Needs Debrid addon)", fontSize = 12.sp, color = Color(0xFFFBBF24))
-                                }
-                            }
+                        }
+                        Spacer(Modifier.height(5.dp)); Text(s.title, fontSize = 13.sp, color = TextWhite); Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (s.url != null) {
+                                val playTitle = if (activeEpLabel.isNotBlank()) "${meta.name} $activeEpLabel" else meta.name
+                                Button(onClick = { onPlay(PlaySession(s, playTitle, meta, activeVid, activeEpLabel, playable, meta.videos)) }, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) { Text("▶ Play") }
+                                OutlinedButton(onClick = { DownloadHelper.enqueue(ctx, playTitle, s); Toast.makeText(ctx, "Downloading…", Toast.LENGTH_SHORT).show() }) { Text("⬇ Save", color = TextWhite) }
+                                OutlinedButton(onClick = { runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(s.url), "video/*")) } }) { Text("External", color = TextWhite) }
+                            } else if (s.externalUrl != null) {
+                                OutlinedButton(onClick = { runCatching { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(s.externalUrl))) } }) { Text("Open Link", color = TextWhite) }
+                            } else Text("Torrent/P2P stream (Needs Debrid addon)", fontSize = 12.sp, color = Color(0xFFFBBF24))
                         }
                     }
                 }
@@ -1038,56 +1333,33 @@ fun DetailScreen(
             item {
                 SectionTitle("Episodes", "${meta.videos.size} total")
                 LazyRow(contentPadding = PaddingValues(horizontal = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (meta.videos.size > 40) {
-                        item {
-                            FilterChip(selected = selectedSeason == -1, onClick = { selectedSeason = -1; rangeIdx = 0 }, label = { Text("All (${meta.videos.size})") })
-                        }
-                    }
-                    items(seasons) { sn ->
-                        FilterChip(selected = selectedSeason == sn, onClick = { selectedSeason = sn; rangeIdx = 0 }, label = { Text(if (sn == 0) "Specials" else "Season $sn") })
-                    }
+                    if (meta.videos.size > 40) item { FilterChip(selected = selectedSeason == -1, onClick = { selectedSeason = -1; rangeIdx = 0 }, label = { Text("All (${meta.videos.size})") }) }
+                    items(seasons) { sn -> FilterChip(selected = selectedSeason == sn, onClick = { selectedSeason = sn; rangeIdx = 0 }, label = { Text(if (sn == 0) "Specials" else "Season $sn") }) }
                 }
             }
-
-            // One Piece / Long Anime 1-100, 101-200 Range Chips + Jump Box
             if (seasonEps.size > 50) {
                 item {
                     val chunks = (seasonEps.size + 99) / 100
                     LazyRow(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         items(chunks) { cIdx ->
-                            val lo = cIdx * 100 + 1
-                            val hi = minOf((cIdx + 1) * 100, seasonEps.size)
-                            FilterChip(
-                                selected = epJump.isBlank() && rangeIdx == cIdx,
-                                onClick = { epJump = ""; rangeIdx = cIdx },
-                                label = { Text("$lo–$hi") }
-                            )
+                            FilterChip(selected = epJump.isBlank() && rangeIdx == cIdx, onClick = { epJump = ""; rangeIdx = cIdx }, label = { Text("${cIdx * 100 + 1}–${minOf((cIdx + 1) * 100, seasonEps.size)}") })
                         }
                     }
                     Row(Modifier.padding(horizontal = 14.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                         OutlinedTextField(
-                            value = epJump,
-                            onValueChange = { epJump = it.filter { ch -> ch.isDigit() }.take(5) },
-                            placeholder = { Text("Jump to Ep # (e.g. 1015)") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(12.dp)
+                            value = epJump, onValueChange = { epJump = it.filter { ch -> ch.isDigit() }.take(5) },
+                            placeholder = { Text("Jump to Ep # (e.g. 1015)") }, singleLine = true, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)
                         )
-                        if (epJump.isNotEmpty()) {
-                            Spacer(Modifier.width(8.dp))
-                            TextButton(onClick = { epJump = "" }) { Text("Clear") }
-                        }
+                        if (epJump.isNotEmpty()) TextButton(onClick = { epJump = "" }) { Text("Clear") }
                     }
                 }
             }
-
             items(chunkedEps, key = { it.id }) { ep ->
                 val done = store.isDone(ep.id)
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 5.dp)
                         .clip(RoundedCornerShape(12.dp)).background(CardDark)
-                        .clickable { findStreams(ep.id, "S${ep.season}E${ep.episode}", ep.season, ep.episode) }
-                        .padding(10.dp),
+                        .clickable { findStreams(ep.id, "S${ep.season}E${ep.episode}", ep.season, ep.episode) }.padding(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Box(Modifier.width(104.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(8.dp)).background(BgDark), contentAlignment = Alignment.Center) {
@@ -1097,14 +1369,8 @@ fun DetailScreen(
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (done) {
-                                Icon(Icons.Rounded.Check, null, tint = Color(0xFF34D399), modifier = Modifier.size(16.dp))
-                                Spacer(Modifier.width(4.dp))
-                            }
-                            Text(
-                                if (selectedSeason == -1) "S${ep.season}E${ep.episode} · ${ep.title}" else "${ep.episode}. ${ep.title}",
-                                fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextWhite, maxLines = 1, overflow = TextOverflow.Ellipsis
-                            )
+                            if (done) { Icon(Icons.Rounded.Check, null, tint = Color(0xFF34D399), modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)) }
+                            Text(if (selectedSeason == -1) "S${ep.season}E${ep.episode} · ${ep.title}" else "${ep.episode}. ${ep.title}", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         ep.overview?.let { Text(it, fontSize = 12.sp, color = TextMut, maxLines = 2, overflow = TextOverflow.Ellipsis) }
                     }
@@ -1118,9 +1384,14 @@ fun DetailScreen(
 fun AddonsScreen(
     addons: List<Addon>,
     jsPlugins: List<JsPlugin>,
+    csProviders: List<CsLoadedProvider>,
+    csRepos: List<String>,
     store: Store,
     onAddStremio: suspend (String) -> String?,
     onAddJsRepo: suspend (String) -> String?,
+    onSaveCsRepoUrl: (String) -> Unit,
+    onCsProvidersChanged: () -> Unit,
+    onBrowseCs: () -> Unit,
     onToggleJs: (Int) -> Unit,
     onRemoveJs: (Int) -> Unit,
     onRemoveStremio: (Int) -> Unit,
@@ -1133,50 +1404,58 @@ fun AddonsScreen(
     val scope = rememberCoroutineScope()
     var input by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("") }
-    var csPreview by remember { mutableStateOf<Pair<String, List<CsPluginInfo>>?>(null) }
+    var repoTitle by remember { mutableStateOf<String?>(null) }
+    var repoPlugins by remember { mutableStateOf<List<CsRepoPlugin>>(emptyList()) }
+    var repoFilter by remember { mutableStateOf("") }
+    var busyKey by remember { mutableStateOf<String?>(null) }
     var cfInput by remember { mutableStateOf("") }
     var backupBox by remember { mutableStateOf("") }
+
+    val openCsRepo: (String) -> Unit = { raw ->
+        status = "Loading CloudStream repo…"
+        repoPlugins = emptyList()
+        scope.launch {
+            runCatching { CsEngine.fetchRepoPlugins(raw) }
+                .onSuccess { (name, list) ->
+                    repoTitle = name
+                    repoPlugins = list
+                    onSaveCsRepoUrl(raw.trim())
+                    status = "Loaded '$name' (${list.size} extensions). Tap Install on any you want!"
+                }
+                .onFailure { status = "Repo error: ${it.message}" }
+        }
+    }
 
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 14.dp), contentPadding = PaddingValues(bottom = 28.dp)) {
         item {
             Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("Addons & Scraper Repos", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = TextWhite)
+                Text("Extensions & Addons", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = TextWhite)
                 IconButton(onClick = onRefresh) { Icon(Icons.Rounded.Refresh, "Refresh", tint = TextWhite) }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    placeholder = { Text("Stremio manifest.json or JS Scraper Repo URL") },
-                    singleLine = true,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(12.dp)
+                    value = input, onValueChange = { input = it },
+                    placeholder = { Text("Shortcode, cloudstreamrepo://, or manifest.json") },
+                    singleLine = true, modifier = Modifier.weight(1f), shape = RoundedCornerShape(12.dp)
                 )
                 Spacer(Modifier.width(8.dp))
                 Button(onClick = {
                     val v = input.trim()
                     if (v.isEmpty()) return@Button
-                    status = "Checking…"
-                    csPreview = null
-                    scope.launch {
-                        if (v.startsWith("cloudstreamrepo:", true) || v.endsWith("/repo.json", true)) {
-                            runCatching { Engine.inspectCloudStreamRepo(v) }
-                                .onSuccess {
-                                    csPreview = it
-                                    status = "Loaded repo '${it.first}' (${it.second.size} plugins). Note: .cs3 plugins are CloudStream-only binaries; use Nuvio JS repos or Stremio addons to stream here."
-                                }
-                                .onFailure { status = "Could not inspect repo: ${it.message}" }
-                        } else if (v.endsWith("manifest.json", true) || v.startsWith("stremio:", true)) {
+                    val isShortcode = !v.contains("://") && !v.contains("/")
+                    val isCsRepo = isShortcode || v.startsWith("cloudstreamrepo:", true) || (v.endsWith(".json", true) && !v.endsWith("manifest.json", true))
+                    if (isCsRepo) {
+                        input = ""
+                        openCsRepo(v)
+                    } else {
+                        status = "Checking…"
+                        scope.launch {
                             val stErr = runCatching { onAddStremio(v) }.getOrElse { it.message ?: "Err" }
                             if (stErr == null) { input = ""; status = "Stremio addon added!" }
                             else {
-                                // Try as Nuvio JS scraper repo manifest.json
                                 val jsErr = runCatching { onAddJsRepo(v) }.getOrElse { it.message ?: stErr }
                                 if (jsErr == null) { input = ""; status = "JS Scraper plugins installed!" } else status = jsErr
                             }
-                        } else {
-                            val jsErr = runCatching { onAddJsRepo(v) }.getOrElse { it.message ?: "Failed" }
-                            if (jsErr == null) { input = ""; status = "JS Scraper plugins installed!" } else status = jsErr
                         }
                     }
                 }) { Icon(Icons.Rounded.Add, null); Text("Add") }
@@ -1184,15 +1463,78 @@ fun AddonsScreen(
             if (status.isNotBlank()) Text(status, fontSize = 13.sp, color = AccentPink, modifier = Modifier.padding(top = 6.dp))
         }
 
-        csPreview?.let { (repoName, list) ->
+        if (csRepos.isNotEmpty()) {
             item {
-                SectionTitle("$repoName (Inspector)", "${list.size} .cs3")
+                Spacer(Modifier.height(6.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(csRepos) { r -> AssistChip(onClick = { openCsRepo(r) }, label = { Text(r.substringAfterLast('/').ifBlank { r }.take(24)) }) }
+                }
             }
-            items(list.take(12)) { p ->
+        }
+
+        if (repoPlugins.isNotEmpty()) {
+            item {
+                SectionTitle(repoTitle ?: "Repo Extensions", "${repoPlugins.size} total")
+                OutlinedTextField(
+                    value = repoFilter, onValueChange = { repoFilter = it },
+                    placeholder = { Text("Filter extensions (e.g. Movie, Anime, Hindi)") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp), shape = RoundedCornerShape(12.dp)
+                )
+            }
+            val shown = repoPlugins.filter { repoFilter.isBlank() || it.name.contains(repoFilter, true) }.take(60)
+            items(shown, key = { it.internalName + it.url }) { p ->
+                val installed = CsEngine.isInstalled(ctx, p.internalName)
+                val busy = busyKey == p.internalName
+                Card(colors = CardDefaults.cardColors(containerColor = CardDark), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(p.name, fontWeight = FontWeight.Bold, color = TextWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(p.tvTypes.joinToString(", ").ifBlank { "Extension" } + " · v${p.version}", fontSize = 11.sp, color = TextMut)
+                        }
+                        if (busy) {
+                            CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                        } else if (installed) {
+                            IconButton(onClick = {
+                                CsEngine.deletePlugin(ctx, p.internalName)
+                                onCsProvidersChanged()
+                            }) { Icon(Icons.Rounded.Delete, "Uninstall", tint = Color(0xFF34D399)) }
+                        } else {
+                            Button(onClick = {
+                                busyKey = p.internalName
+                                scope.launch {
+                                    val res = CsEngine.installAndLoad(ctx, p)
+                                    busyKey = null
+                                    res.onSuccess { list ->
+                                        onCsProvidersChanged()
+                                        status = "Installed ${p.name} (${list.size} provider loaded)!"
+                                    }.onFailure { err ->
+                                        status = "Error loading ${p.name}: ${err.message}"
+                                    }
+                                }
+                            }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)) { Text("Install") }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (csProviders.isNotEmpty()) {
+            item {
+                Row(Modifier.fillMaxWidth().padding(top = 14.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text("Loaded .cs3 Providers (${csProviders.size})", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = TextWhite)
+                    TextButton(onClick = onBrowseCs) { Text("Browse →") }
+                }
+            }
+            items(csProviders) { cp ->
                 Card(colors = CardDefaults.cardColors(containerColor = CardDark), modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-                    Column(Modifier.padding(10.dp)) {
-                        Text(p.name, fontWeight = FontWeight.Bold, color = TextWhite)
-                        if (p.tvTypes.isNotBlank()) Text("${p.tvTypes} · .cs3 binary", fontSize = 11.sp, color = TextMut)
+                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(cp.api.name, fontWeight = FontWeight.Bold, color = TextWhite)
+                            Text(cp.api.mainUrl, fontSize = 11.sp, color = TextMut, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        IconButton(onClick = { CsEngine.deletePlugin(ctx, cp.pluginKey); onCsProvidersChanged() }) {
+                            Icon(Icons.Rounded.Delete, "Remove", tint = TextWhite)
+                        }
                     }
                 }
             }
@@ -1298,7 +1640,7 @@ fun PlayerScreen(
     var sheetMode by remember { mutableStateOf<String?>(null) }
     var epRangeIdx by remember { mutableIntStateOf(0) }
 
-    var extSubs by remember { mutableStateOf<List<SubItem>>(emptyList()) }
+    var extSubs by remember { mutableStateOf(session.extraSubs) }
     var activeCues by remember { mutableStateOf<List<SubCue>>(emptyList()) }
     var activeExtLabel by remember { mutableStateOf("None") }
     var subOffsetMs by remember { mutableLongStateOf(0L) }
@@ -1348,7 +1690,8 @@ fun PlayerScreen(
     }
 
     LaunchedEffect(session.vid) {
-        extSubs = Engine.fetchSubtitles(addons, session.meta.type, session.vid)
+        val onlineSubs = if (session.csApi == null) Engine.fetchSubtitles(addons, session.meta.type, session.vid) else emptyList()
+        extSubs = (session.extraSubs + onlineSubs).distinctBy { it.url }
     }
 
     DisposableEffect(exoPlayer) {
@@ -1365,9 +1708,7 @@ fun PlayerScreen(
                     party.send(JSONObject().put("t", "sync").put("state", if (playing) "play" else "pause").put("time", exoPlayer.currentPosition))
                 }
             }
-            override fun onPlayerError(error: PlaybackException) {
-                errMsg = error.localizedMessage ?: "Playback failed"
-            }
+            override fun onPlayerError(error: PlaybackException) { errMsg = error.localizedMessage ?: "Playback failed" }
         }
         exoPlayer.addListener(listener)
 
@@ -1404,13 +1745,7 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(hudText) {
-        if (hudText != null) {
-            delay(950L)
-            hudText = null
-        }
-    }
-
+    LaunchedEffect(hudText) { if (hudText != null) { delay(950L); hudText = null } }
     BackHandler { if (sheetMode != null) sheetMode = null else onClose() }
 
     val sendSeek: (Long) -> Unit = { target ->
@@ -1423,14 +1758,23 @@ fun PlayerScreen(
     val loadEpisode: (VideoEp) -> Unit = { ep ->
         scope.launch {
             hudText = "Loading S${ep.season}E${ep.episode}…"
-            val ss = (Engine.fetchStreams(addons, session.meta.type, ep.id) +
-                jsPlugins.filter { it.enabled }.flatMap { runCatching { jsRunner.runScraper(it, session.meta, ep.season, ep.episode) }.getOrDefault(emptyList()) })
-                .filter { it.url != null }
-            val pick = ss.firstOrNull { it.addonName == session.stream.addonName } ?: ss.firstOrNull()
-            if (pick != null) {
-                val lab = "S${ep.season}E${ep.episode}"
-                onSwitchSession(PlaySession(pick, "${session.meta.name} $lab", session.meta, ep.id, lab, ss, session.episodes))
-            } else hudText = "No stream found"
+            if (session.csApi != null) {
+                val (ss, subs) = CsEngine.loadLinks(session.csApi, ep.id)
+                val pick = ss.firstOrNull { it.url != null }
+                if (pick != null) {
+                    val lab = "S${ep.season}E${ep.episode}"
+                    onSwitchSession(PlaySession(pick, "${session.meta.name} $lab", session.meta, ep.id, lab, ss, session.episodes, csApi = session.csApi, extraSubs = subs))
+                } else hudText = "No stream found"
+            } else {
+                val ss = (Engine.fetchStreams(addons, session.meta.type, ep.id) +
+                    jsPlugins.filter { it.enabled }.flatMap { runCatching { jsRunner.runScraper(it, session.meta, ep.season, ep.episode) }.getOrDefault(emptyList()) })
+                    .filter { it.url != null }
+                val pick = ss.firstOrNull { it.addonName == session.stream.addonName } ?: ss.firstOrNull()
+                if (pick != null) {
+                    val lab = "S${ep.season}E${ep.episode}"
+                    onSwitchSession(PlaySession(pick, "${session.meta.name} $lab", session.meta, ep.id, lab, ss, session.episodes))
+                } else hudText = "No stream found"
+            }
         }
     }
 
@@ -1507,28 +1851,19 @@ fun PlayerScreen(
                     }
             )
 
-            // Customizable External Subtitle Overlay
             if (activeCues.isNotEmpty()) {
                 val t = posMs - subOffsetMs
                 val text = activeCues.filter { t in it.startMs..it.endMs }.joinToString("\n") { it.text }
                 if (text.isNotBlank()) {
                     val subCol = Color(subPrefs.colorHex)
-                    val bgCol = when (subPrefs.bgStyle) {
-                        0 -> Color.Black.copy(alpha = 0.74f)
-                        else -> Color.Transparent
-                    }
+                    val bgCol = if (subPrefs.bgStyle == 0) Color.Black.copy(alpha = 0.74f) else Color.Transparent
                     val shadow = if (subPrefs.bgStyle == 1) Shadow(Color.Black, blurRadius = 6f) else null
                     Text(
-                        text,
-                        color = subCol,
-                        fontSize = subPrefs.sizeSp.sp,
-                        textAlign = TextAlign.Center,
+                        text, color = subCol, fontSize = subPrefs.sizeSp.sp, textAlign = TextAlign.Center,
                         style = TextStyle(shadow = shadow),
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
+                        modifier = Modifier.align(Alignment.BottomCenter)
                             .padding(horizontal = 24.dp, vertical = if (showControls) (subPrefs.bottomDp + 72).dp else subPrefs.bottomDp.dp)
-                            .background(bgCol, RoundedCornerShape(8.dp))
-                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                            .background(bgCol, RoundedCornerShape(8.dp)).padding(horizontal = 12.dp, vertical = 4.dp)
                     )
                 }
             }
@@ -1558,9 +1893,9 @@ fun PlayerScreen(
                                 }
                             }
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                IconButton(onClick = {
-                                    activity?.enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build())
-                                }) { Icon(Icons.Rounded.PictureInPictureAlt, "PiP", tint = Color.White) }
+                                IconButton(onClick = { activity?.enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(Rational(16, 9)).build()) }) {
+                                    Icon(Icons.Rounded.PictureInPictureAlt, "PiP", tint = Color.White)
+                                }
                             }
                             IconButton(onClick = { locked = true }) { Icon(Icons.Rounded.Lock, "Lock", tint = Color.White) }
                         }
