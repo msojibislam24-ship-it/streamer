@@ -34,7 +34,14 @@ jobs:
           fi
 
       - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+        run: |
+          if ! gradle assembleDebug --no-daemon --console=plain > build.log 2>&1; then
+            echo "=== KOTLIN ERRORS ==="
+            grep -n -C 2 "^e: " build.log | tail -n 60 || true
+            echo "=== END OF LOG ==="
+            tail -n 35 build.log
+            exit 1
+          fi
 
       - name: Prepare APK
         run: cp app/build/outputs/apk/debug/app-debug.apk Streamer.apk
