@@ -1,12 +1,16 @@
 package com.streamer.app
 
 import android.content.Context
+import com.lagradost.api.setContext
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import dalvik.system.PathClassLoader
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
@@ -44,6 +48,7 @@ data class CsMediaDetail(
 
 object CsEngine {
     val loadedProviders = mutableListOf<CsLoadedProvider>()
+    val loadErrors = mutableMapOf<String, String>()
 
     suspend fun resolveRepoInput(raw: String): String = withContext(Dispatchers.IO) {
         val trimmed = raw.trim()
@@ -58,8 +63,7 @@ object CsEngine {
                 .header("User-Agent", Engine.userAgent)
                 .build()
             noRedirectClient.newCall(req).execute().use { res ->
-                val loc = res.header("Location")
-                    ?: error("Shortcode '$trimmed' not found")
+                val loc = res.header("Location") ?: error("Shortcode '$trimmed' not found")
                 if (loc.startsWith("https://cutt.ly/404") || loc.trimEnd('/') == "https://cutt.ly") {
                     error("Invalid shortcode '$trimmed'")
                 }
@@ -114,6 +118,7 @@ object CsEngine {
         val f = pluginFile(ctx, internalName)
         if (f.exists()) f.delete()
         loadedProviders.removeAll { it.pluginKey == internalName }
+        loadErrors.remove(internalName)
     }
 
     suspend fun installAndLoad(ctx: Context, plugin: CsRepoPlugin): Result<List<MainAPI>> = withContext(Dispatchers.IO) {
@@ -127,20 +132,27 @@ object CsEngine {
                 file.writeBytes(bytes)
             }
             loadCs3File(ctx, plugin.internalName, file)
+        }.onFailure { err ->
+            loadErrors[plugin.internalName] = err.javaClass.simpleName + ": " + (err.message ?: "Load failed")
         }
     }
 
     fun loadAllInstalled(ctx: Context) {
+        runCatching { setContext(ctx.applicationContext) }
         val dir = pluginDir(ctx)
         dir.listFiles { f -> f.extension == "cs3" }?.forEach { f ->
             val key = f.nameWithoutExtension
             if (loadedProviders.none { it.pluginKey == key }) {
                 runCatching { loadCs3File(ctx, key, f) }
+                    .onFailure { err ->
+                        loadErrors[key] = err.javaClass.simpleName + ": " + (err.message ?: "Load failed")
+                    }
             }
         }
     }
 
     private fun loadCs3File(ctx: Context, pluginKey: String, file: File): List<MainAPI> {
+        runCatching { setContext(ctx.applicationContext) }
         file.setReadOnly()
         val className = ZipFile(file).use { zip ->
             val entry = zip.getEntry("manifest.json") ?: error("No manifest.json in .cs3")
@@ -153,30 +165,38 @@ object CsEngine {
         val cls = Class.forName(className, true, loader)
         val instance = cls.getDeclaredConstructor().newInstance() as? Plugin
             ?: error("$className is not a CloudStream Plugin")
+        instance.__filename = file.absolutePath
         instance.load(ctx)
 
         val added = APIHolder.allProviders.filter { it !in before }
         runCatching { APIHolder.initAll() }
 
         loadedProviders.removeAll { it.pluginKey == pluginKey }
-        added.forEach { api ->
-            loadedProviders += CsLoadedProvider(pluginKey, api)
+        if (added.isEmpty()) {
+            loadErrors[pluginKey] = "0 providers registered (may be an extractor-only plugin)"
+        } else {
+            loadErrors.remove(pluginKey)
+            added.forEach { api -> loadedProviders += CsLoadedProvider(pluginKey, api) }
         }
         return added
     }
 
-    suspend fun getMainSections(api: MainAPI, page: Int = 1): List<Pair<String, List<SearchResponse>>> = withContext(Dispatchers.IO) {
+    suspend fun getMainSections(api: MainAPI, page: Int = 1): Pair<List<Pair<String, List<SearchResponse>>>, String?> = withContext(Dispatchers.IO) {
         val pages = api.mainPage
+        if (pages.isEmpty() || api.mainUrl == "NONE") {
+            return@withContext emptyList<Pair<String, List<SearchResponse>>>() to "${api.name} has no home catalog (try Search or install a movie/anime provider like MultiMovies / HiAnime / StreamPlay)."
+        }
         val out = mutableListOf<Pair<String, List<SearchResponse>>>()
+        var lastErr: String? = null
         for (mp in pages.take(6)) {
             runCatching {
                 val res = api.getMainPage(page, MainPageRequest(mp.name, mp.data, false))
-                res?.items?.forEach { hl ->
-                    if (hl.list.isNotEmpty()) out += hl.name to hl.list
-                }
+                res?.items?.forEach { hl -> if (hl.list.isNotEmpty()) out += hl.name to hl.list }
+            }.onFailure { e ->
+                lastErr = e.message ?: e.javaClass.simpleName
             }
         }
-        out
+        out to (if (out.isEmpty()) lastErr ?: "No items returned" else null)
     }
 
     suspend fun search(api: MainAPI, query: String): List<SearchResponse> = withContext(Dispatchers.IO) {
@@ -251,5 +271,43 @@ object CsEngine {
             )
         }
         streams.distinctBy { it.url } to subs.distinctBy { it.url }
+    }
+
+    // Automatically searches installed .cs3 providers by title when tapping Find Streams on Home/Cinemeta
+    suspend fun findStreamsFromProviders(meta: MetaItem, season: Int, episode: Int): Pair<List<StreamItem>, List<SubItem>> = coroutineScope {
+        val activeApis = loadedProviders.map { it.api }.filter { it.mainUrl != "NONE" && it.mainUrl.isNotBlank() }.take(6)
+        if (activeApis.isEmpty()) return@coroutineScope emptyList<StreamItem>() to emptyList<SubItem>()
+        val cleanTitle = meta.name.lowercase().replace(Regex("[^a-z0-9 ]"), " ").trim()
+        val jobs = activeApis.map { api ->
+            async(Dispatchers.IO) {
+                withTimeoutOrNull(12_000L) {
+                    val hits = search(api, meta.name)
+                    val match = hits.firstOrNull {
+                        it.name.lowercase().replace(Regex("[^a-z0-9 ]"), " ").trim() == cleanTitle
+                    } ?: hits.firstOrNull {
+                        it.name.contains(meta.name, ignoreCase = true)
+                    } ?: return@withTimeoutOrNull null
+
+                    val detail = loadDetail(api, match.url) ?: return@withTimeoutOrNull null
+                    val targetEp = if (meta.type == "series" && !detail.isMovie) {
+                        detail.episodes.firstOrNull { it.season == season && it.episode == episode }
+                            ?: detail.episodes.firstOrNull { it.episode == episode }
+                    } else {
+                        detail.episodes.firstOrNull()
+                    } ?: return@withTimeoutOrNull null
+
+                    loadLinks(api, targetEp.id)
+                }
+            }
+        }
+        val allStreams = mutableListOf<StreamItem>()
+        val allSubs = mutableListOf<SubItem>()
+        jobs.forEach { job ->
+            job.await()?.let { (ss, sb) ->
+                allStreams += ss
+                allSubs += sb
+            }
+        }
+        allStreams.distinctBy { it.url } to allSubs.distinctBy { it.url }
     }
 }
