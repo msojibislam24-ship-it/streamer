@@ -14,7 +14,10 @@ abstract class Plugin {
     var __filename: String? = null
     var openSettings: ((context: Context) -> Unit)? = null
 
-    open fun load(context: Context) {}
+    open fun load(context: Context) {
+        load()
+    }
+
     open fun load() {}
     open fun beforeUnload() {}
 
