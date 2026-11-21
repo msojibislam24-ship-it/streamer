@@ -13,7 +13,7 @@ android {
         minSdk = 24
         targetSdk = 35
         versionCode = 1
-        versionName = "1.0"
+        versionName = "2.1"
     }
 
     buildTypes {
@@ -34,6 +34,12 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    packaging {
+        resources {
+            excludes += setOf("META-INF/DEPENDENCIES", "META-INF/INDEX.LIST")
+        }
+    }
 }
 
 dependencies {
@@ -52,4 +58,11 @@ dependencies {
     implementation("androidx.media3:media3-datasource-okhttp:$media3")
     implementation("androidx.media3:media3-ui:$media3")
     implementation("androidx.media3:media3-common:$media3")
+
+    // CloudStream3 plugin runtime & dependencies
+    implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
+    implementation("com.github.Blatzar:NiceHttp:0.4.11")
+    implementation("org.jsoup:jsoup:1.18.3")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
+    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.25.2")
 }
