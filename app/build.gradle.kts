@@ -61,10 +61,15 @@ dependencies {
     implementation("androidx.media3:media3-ui:$media3")
     implementation("androidx.media3:media3-common:$media3")
 
-    // CloudStream3 plugin runtime & dependencies
-    implementation("com.github.recloudstream.cloudstream:library:-SNAPSHOT")
-    implementation("com.github.Blatzar:NiceHttp:0.4.11")
-    implementation("org.jsoup:jsoup:1.18.3")
+    // CloudStream3 plugin runtime & dependencies.
+    // Pinned to the exact recloudstream/cloudstream commit the compat layer
+    // (app/src/main/java/com/lagradost/cloudstream3/**) was validated against.
+    // NOTE: must be the `library-android` artifact — the KMP root `library`
+    // coordinate publishes broken metadata (empty jar) on JitPack.
+    // Bump together with the compat layer and re-verify a phisher98 plugin loads.
+    implementation("com.github.recloudstream.cloudstream:library-android:a28e6468f5")
+    implementation("com.github.Blatzar:NiceHttp:0.4.18")
+    implementation("org.jsoup:jsoup:1.22.1")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
-    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.25.2")
+    implementation("com.github.teamnewpipe:NewPipeExtractor:v0.26.3")
 }
