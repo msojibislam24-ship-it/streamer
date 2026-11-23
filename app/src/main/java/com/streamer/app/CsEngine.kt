@@ -1,10 +1,28 @@
 package com.streamer.app
 
+import android.app.Activity
+import android.app.Application
 import android.content.Context
+import android.os.Bundle
 import com.lagradost.api.setContext
-import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.APIHolder
+import com.lagradost.cloudstream3.AnimeLoadResponse
+import com.lagradost.cloudstream3.InternalAPI
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.MovieLoadResponse
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.TvSeriesLoadResponse
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.CloudStreamApp
+import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.plugins.PluginManager
+import com.lagradost.cloudstream3.utils.AppUtils
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.nicehttp.Requests
+import com.lagradost.nicehttp.ResponseParser
 import dalvik.system.PathClassLoader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -15,7 +33,9 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipFile
+import kotlin.reflect.KClass
 
 data class CsRepoPlugin(
     val name: String,
@@ -45,6 +65,84 @@ data class CsMediaDetail(
     val isMovie: Boolean,
     val episodes: List<VideoEp>
 )
+
+/**
+ * Bootstraps the CloudStream runtime pieces that extensions expect but the
+ * published library does not provide (app-module classes), and wires the
+ * library's global HTTP client to the host client so extensions share the
+ * WebView cookie jar (Cloudflare solutions solved in the host UI keep working
+ * inside providers).
+ */
+object CsRuntime {
+    @Volatile
+    private var initialized = false
+    private val lock = Any()
+
+    fun init(ctx: Context) {
+        if (initialized) return
+        synchronized(lock) {
+            if (initialized) return
+            initialized = true
+
+            val appCtx = ctx.applicationContext
+            runCatching { setContext(appCtx) }
+            runCatching { CloudStreamApp.init(appCtx) }
+
+            // Track the foreground activity for extension toasts/dialogs.
+            runCatching {
+                (appCtx as? Application)?.registerActivityLifecycleCallbacks(
+                    object : Application.ActivityLifecycleCallbacks {
+                        override fun onActivityResumed(activity: Activity) {
+                            CommonActivity.setActivityInstance(activity)
+                        }
+
+                        override fun onActivityPaused(activity: Activity) {}
+                        override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+                        override fun onActivityStarted(activity: Activity) {}
+                        override fun onActivityStopped(activity: Activity) {}
+                        override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+                        override fun onActivityDestroyed(activity: Activity) {}
+                    }
+                )
+            }
+
+            // Swap the library's default networking for the host client, so
+            // extension requests share cookies (Cloudflare) and sane timeouts.
+            runCatching {
+                val parser = object : ResponseParser {
+                    @OptIn(InternalAPI::class)
+                    override fun <T : Any> parse(text: String, kClass: KClass<T>): T =
+                        AppUtils.parseJson(text, kClass)
+
+                    override fun <T : Any> parseSafe(text: String, kClass: KClass<T>): T? =
+                        runCatching { parse(text, kClass) }.getOrNull()
+
+                    @OptIn(InternalAPI::class)
+                    override fun writeValueAsString(obj: Any): String =
+                        with(AppUtils) { obj.toJson() }
+                }
+                val client = Engine.http.newBuilder()
+                    .connectTimeout(20, TimeUnit.SECONDS)
+                    .readTimeout(30, TimeUnit.SECONDS)
+                    .build()
+                app = Requests(
+                    baseClient = client,
+                    responseParser = parser
+                ).apply {
+                    defaultHeaders = mapOf("user-agent" to Engine.userAgent)
+                }
+            }
+
+            // Let the PluginManager compat shim load files through the host loader.
+            PluginManager.externalLoader = { context, internalName, file ->
+                runCatching {
+                    CsEngine.loadCs3File(context, internalName, file)
+                    true
+                }.getOrDefault(false)
+            }
+        }
+    }
+}
 
 object CsEngine {
     val loadedProviders = mutableListOf<CsLoadedProvider>()
@@ -116,12 +214,14 @@ object CsEngine {
 
     fun deletePlugin(ctx: Context, internalName: String) {
         val f = pluginFile(ctx, internalName)
+        runCatching { PluginManager.unloadPlugin(f.absolutePath) }
         if (f.exists()) f.delete()
         loadedProviders.removeAll { it.pluginKey == internalName }
         loadErrors.remove(internalName)
     }
 
     suspend fun installAndLoad(ctx: Context, plugin: CsRepoPlugin): Result<List<MainAPI>> = withContext(Dispatchers.IO) {
+        CsRuntime.init(ctx)
         runCatching {
             val file = pluginFile(ctx, plugin.internalName)
             if (file.exists()) file.setWritable(true)
@@ -138,6 +238,7 @@ object CsEngine {
     }
 
     fun loadAllInstalled(ctx: Context) {
+        CsRuntime.init(ctx)
         runCatching { setContext(ctx.applicationContext) }
         val dir = pluginDir(ctx)
         dir.listFiles { f -> f.extension == "cs3" }?.forEach { f ->
@@ -149,9 +250,17 @@ object CsEngine {
                     }
             }
         }
+        runCatching {
+            com.lagradost.cloudstream3.MainActivity.Companion.afterPluginsLoadedEvent.invoke(false)
+        }
     }
 
-    private fun loadCs3File(ctx: Context, pluginKey: String, file: File): List<MainAPI> {
+    /**
+     * Loads a downloaded .cs3 plugin dex, instantiates its Plugin entry class
+     * and returns the MainAPI providers it registered.
+     */
+    fun loadCs3File(ctx: Context, pluginKey: String, file: File): List<MainAPI> {
+        CsRuntime.init(ctx)
         runCatching { setContext(ctx.applicationContext) }
         file.setReadOnly()
         val className = ZipFile(file).use { zip ->
@@ -160,25 +269,35 @@ object CsEngine {
             JSONObject(txt).optString("pluginClassName").ifBlank { error("Missing pluginClassName") }
         }
 
-        val before = APIHolder.allProviders.toSet()
-        val loader = PathClassLoader(file.absolutePath, ctx.classLoader)
-        val cls = Class.forName(className, true, loader)
-        val instance = cls.getDeclaredConstructor().newInstance() as? Plugin
-            ?: error("$className is not a CloudStream Plugin")
-        instance.__filename = file.absolutePath
-        instance.load(ctx)
+        PluginManager.currentlyLoading = pluginKey
+        try {
+            val before = APIHolder.allProviders.toSet()
+            val loader = PathClassLoader(file.absolutePath, ctx.classLoader)
+            val cls = Class.forName(className, true, loader)
+            val instance = cls.getDeclaredConstructor().newInstance() as? BasePlugin
+                ?: error("$className is not a CloudStream Plugin")
+            instance.filename = file.absolutePath
+            runCatching { PluginManager.registerPlugin(file.absolutePath, instance) }
 
-        val added = APIHolder.allProviders.filter { it !in before }
-        runCatching { APIHolder.initAll() }
+            when (instance) {
+                is Plugin -> instance.load(ctx)
+                else -> instance.load()
+            }
 
-        loadedProviders.removeAll { it.pluginKey == pluginKey }
-        if (added.isEmpty()) {
-            loadErrors[pluginKey] = "0 providers registered (may be an extractor-only plugin)"
-        } else {
-            loadErrors.remove(pluginKey)
-            added.forEach { api -> loadedProviders += CsLoadedProvider(pluginKey, api) }
+            val added = APIHolder.allProviders.filter { it !in before }
+            runCatching { APIHolder.initAll() }
+
+            loadedProviders.removeAll { it.pluginKey == pluginKey }
+            if (added.isEmpty()) {
+                loadErrors[pluginKey] = "0 providers registered (may be an extractor-only plugin)"
+            } else {
+                loadErrors.remove(pluginKey)
+                added.forEach { api -> loadedProviders += CsLoadedProvider(pluginKey, api) }
+            }
+            return added
+        } finally {
+            PluginManager.currentlyLoading = null
         }
-        return added
     }
 
     suspend fun getMainSections(api: MainAPI, page: Int = 1): Pair<List<Pair<String, List<SearchResponse>>>, String?> = withContext(Dispatchers.IO) {
